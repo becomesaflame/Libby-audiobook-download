@@ -1,0 +1,580 @@
+import os
+import re
+import time
+import requests
+import json # Import the json library for config file handling
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright_stealth import Stealth # Import the stealth library
+
+# --- Configuration File Path ---
+CONFIG_FILE = 'libby_config.json'
+
+# --- Global Variables for Tracking Download Progress ---
+downloaded_parts = set()
+max_part_number_found = 0
+# Note: In a single-threaded sync_playwright script, this might not be strictly necessary
+# for these simple variables, but it's good practice for shared state in async contexts
+# or if more complex threading was introduced. For this script, we'll rely on the
+# sequential nature of request handling within the Playwright event loop.
+
+# --- Configuration Management Functions ---
+def load_config():
+    """Loads configuration from a JSON file, or prompts user if not found/incomplete."""
+    config = {}
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                config = json.load(f)
+            print(f"Loaded configuration from {CONFIG_FILE}.")
+        except json.JSONDecodeError:
+            print(f"Error reading {CONFIG_FILE}. It might be corrupted. Re-prompting for details.")
+            config = {} # Reset config if corrupted
+    else:
+        print(f"Configuration file {CONFIG_FILE} not found. Will prompt for details.")
+
+    # Check for required fields and prompt if missing
+    # LIBRARY_CARD_USAGE_OPTION_INDEX is added here to be stored in config
+    required_fields = ['LIBRARY_CARD_NUMBER', 'LIBBY_PASSWORD', 'LIBRARY', 'DOWNLOAD_DIRECTORY', 'LIBRARY_CARD_USAGE_OPTION_INDEX']
+    for field in required_fields:
+        if field not in config or not config[field]:
+            if field == 'LIBRARY_CARD_NUMBER':
+                config[field] = input(f"Please enter your {field.replace('_', ' ')}: ")
+            elif field == 'LIBBY_PASSWORD':
+                config[field] = input(f"Please enter your {field.replace('_', ' ')} (PIN): ")
+            elif field == 'LIBRARY':
+                config[field] = input(f"Please enter your {field.replace('_', ' ')} (e.g., Boston Public Library): ")
+            elif field == 'DOWNLOAD_DIRECTORY':
+                default_dir = os.path.join(os.getcwd(), "Libby_Audiobook_Downloads")
+                config[field] = input(f"Enter download directory (default: {default_dir}): ") or default_dir
+            elif field == 'LIBRARY_CARD_USAGE_OPTION_INDEX':
+                # This field will be set later in the run function after options are fetched
+                # For initial load, we'll leave it as None or an empty string, and handle the prompt there.
+                # If it's missing, it will be prompted for during the first run.
+                pass # Handled in run() function where options are dynamically retrieved
+
+            # Save after each new input, except for LIBRARY_CARD_USAGE_OPTION_INDEX which needs dynamic options
+            if field != 'LIBRARY_CARD_USAGE_OPTION_INDEX':
+                save_config(config)
+
+    # Ensure DOWNLOAD_DIRECTORY exists
+    if not os.path.exists(config['DOWNLOAD_DIRECTORY']):
+        os.makedirs(config['DOWNLOAD_DIRECTORY'])
+        print(f"Created download directory: {config['DOWNLOAD_DIRECTORY']}")
+
+    return config
+
+def save_config(config_data):
+    """Saves configuration to a JSON file."""
+    with open(CONFIG_FILE, 'w') as f:
+        json.dump(config_data, f, indent=4)
+    print(f"Saved configuration to {CONFIG_FILE}.")
+
+# --- Network Request Handler ---
+def handle_request(request):
+    """
+    Callback function to process intercepted network requests.
+    Identifies and downloads audiobook MP3 parts directly using Playwright's response.
+    """
+    global downloaded_parts, max_part_number_found
+
+    url = request.url
+    # print(f"Intercepting network request for url: {url}") # Uncomment for verbose request logging
+
+    # Filter requests for MP3 parts based on observed patterns
+    # (contains "Part")
+    if "Part" in url:
+        part_match = re.search(r"Part(\d+).mp3", url, re.IGNORECASE)
+        if part_match:
+            part_number = int(part_match.group(1))
+
+            if part_number not in downloaded_parts:
+                print(f"Detected new part: {url} (Part {part_number})")
+                file_name = f"Part_{part_number:02d}.mp3" # e.g., Part_01.mp3, Part_10.mp3
+                # Use the DOWNLOAD_DIRECTORY from the loaded config
+                file_path = os.path.join(config['DOWNLOAD_DIRECTORY'], file_name)
+
+                try:
+                    # Get the response object for the intercepted request
+                    # Playwright automatically follows redirects, so this response
+                    # should be for the final MP3 content from the CDN.
+                    response = request.response()
+                    if response and response.status == 200:
+                        # Get the body directly from Playwright's response.
+                        # This ensures all browser context (cookies, referer, etc.) is used.
+                        content = response.body()
+
+                        with open(file_path, "wb") as f:
+                            f.write(content)
+
+                        print(f"Successfully downloaded {file_name}")
+                        downloaded_parts.add(part_number)
+                        max_part_number_found = max(max_part_number_found, part_number)
+                    else:
+                        print(f"Failed to get successful response for {url}. Status: {response.status if response else 'No Response'}")
+
+                except Exception as e:
+                    print(f"An unexpected error occurred during download of {file_name} from {url}: {e}")
+            else:
+                # print(f"Part {part_number} already downloaded, skipping.") # Uncomment for verbose logging
+                pass
+
+# Global variable for configuration (will be loaded in run())
+config = {}
+
+def run():
+    """Main function to execute the automation script."""
+    global config # Declare that we are using the global config variable
+
+    # Load configuration at the start
+    config = load_config()
+
+    # Playwright Browser Settings - now uses HEADLESS_MODE from config
+    HEADLESS_MODE = False # Keep this as False for debugging, can be moved to config later if desired
+
+    # Initialize Playwright with the stealth plugin
+    with Stealth().use_sync(sync_playwright()) as p:
+        browser = None # Initialize browser to None for proper cleanup in finally block
+        try:
+            print("Launching browser...")
+            launch_args = {
+                "headless": HEADLESS_MODE,
+                "args": ["--no-sandbox", "--disable-setuid-sandbox"],
+                "channel": "chrome" # Explicitly request the branded Chrome channel
+            }
+
+            # Path to your Chrome executable.
+            # When using channel="chrome", Playwright will attempt to find your installed Google Chrome.
+            # You typically don't need to specify executable_path when using 'channel'.
+            # Keeping it commented out for clarity.
+            # CHROME_EXECUTABLE_PATH = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'
+            # If CHROME_EXECUTABLE_PATH was defined and uncommented, it would be used here.
+            # However, for 'channel' to work effectively, it's often best not to specify
+            # executable_path unless absolutely necessary for a custom build.
+            # Playwright will attempt to find the 'chrome' channel installation.
+            # if 'CHROME_EXECUTABLE_PATH' in globals() and CHROME_EXECUTABLE_PATH:
+            #     print(f"Note: CHROME_EXECUTABLE_PATH is set but 'channel' is also used. "
+            #           f"Playwright will prioritize 'channel' to find the branded Chrome.")
+            #     launch_args["executable_path"] = CHROME_EXECUTABLE_PATH
+
+
+            browser = p.chromium.launch(**launch_args)
+            page = browser.new_page()
+
+            # Attach the request handler
+            page.on("request", handle_request)
+
+            # --- Step 1: Login to Libby ---
+            print("Navigating to Libby login page...")
+            page.goto("https://libbyapp.com/")
+            page.wait_for_load_state('networkidle') # Wait for initial page load
+            page.screenshot(path=os.path.join(config['DOWNLOAD_DIRECTORY'], "01_initial_load.png"))
+
+            # Click "Yes, I Have A Library Card" button
+            print("Clicking 'Yes, I Have A Library Card' button...")
+            try:
+                # Using the role and text content for a robust selector
+                page.click('button[role="button"]:has-text("Yes, I Have A Library Card")')
+                page.wait_for_load_state('networkidle')
+                time.sleep(2) # Give a moment for the next page to load
+                page.screenshot(path=os.path.join(config['DOWNLOAD_DIRECTORY'], "02_after_yes_card.png"))
+            except PlaywrightTimeoutError:
+                print("Error: Could not find or click the 'Yes, I Have A Library Card' button. "
+                      "The page might have changed or loaded unexpectedly.")
+                return
+
+            # Click "Search For A Library" button
+            print("Clicking 'Search For A Library' button...")
+            try:
+                # Using the role and text content for a robust selector
+                page.click('button[role="button"]:has-text("Search For A Library")')
+                page.wait_for_load_state('networkidle')
+                time.sleep(2) # Give a moment for the next page to load
+                page.screenshot(path=os.path.join(config['DOWNLOAD_DIRECTORY'], "03_after_search_library.png"))
+            except PlaywrightTimeoutError:
+                print("Error: Could not find or click the 'Search For A Library' button. "
+                      "The page might have changed or loaded unexpectedly.")
+                return
+
+            # Enter library name into search field
+            print(f"Entering library name: '{config['LIBRARY']}' into search field...")
+            try:
+                # Using the provided HTML, the input has id="shibui-form-input-control-0001"
+                # and placeholder="Search…". The ID is the most reliable selector.
+                page.fill('#shibui-form-input-control-0001', config['LIBRARY'])
+                page.wait_for_load_state('networkidle')
+                time.sleep(3) # Give time for search results to load (search happens automatically)
+                page.screenshot(path=os.path.join(config['DOWNLOAD_DIRECTORY'], "04_after_library_search_input.png"))
+            except PlaywrightTimeoutError:
+                print("Error: Could not find or fill the library search input field. "
+                      "Please inspect the selector.")
+                return
+
+            # Click on the top search result for the library
+            print("Clicking on the top search result for the library...")
+            try:
+                # Fix: Changed f-string outer quotes to double quotes to resolve SyntaxError
+                page.click(f"text=\"{config['LIBRARY']}\" >> nth=0")
+                page.wait_for_load_state('networkidle')
+                time.sleep(3) # Give time for the page to load after selecting library
+                page.screenshot(path=os.path.join(config['DOWNLOAD_DIRECTORY'], "05_after_select_library.png"))
+            except PlaywrightTimeoutError:
+                print("Error: Could not find or click the top search result for the library. "
+                      "Please inspect the selector.")
+                return
+
+            # Click "Sign In With My Card" button
+            print("Clicking 'Sign In With My Card' button...")
+            try:
+                # Using the role and text content for a robust selector
+                page.click('button[role="button"]:has-text("Sign In With My Card")')
+                page.wait_for_load_state('networkidle')
+                time.sleep(2) # Give a moment for the next page to load
+                page.screenshot(path=os.path.join(config['DOWNLOAD_DIRECTORY'], "06_after_sign_in_with_card.png"))
+            except PlaywrightTimeoutError:
+                print("Error: Could not find or click the 'Sign In With My Card' button. "
+                      "The page might have changed or loaded unexpectedly.")
+                return
+
+            # --- Handle library card usage option ---
+            print("\nHandling 'Where do you use your library card?' option...")
+            try:
+                # Wait for the options to be visible
+                page.wait_for_selector('.auth-ils-list button', timeout=10000)
+
+                # Get all library choice buttons
+                library_choice_buttons = page.locator('.auth-ils-list button').all()
+                options_text = []
+                for i, button in enumerate(library_choice_buttons):
+                    # Extract text, stripping whitespace and filtering out empty strings
+                    text = button.text_content().strip()
+                    if text: # Only add non-empty text
+                        options_text.append(text)
+
+                if not options_text:
+                    print("No library card usage options found on the page.")
+                    return
+
+                # If the option index is not in config or invalid, prompt the user
+                if 'LIBRARY_CARD_USAGE_OPTION_INDEX' not in config or \
+                   not (0 <= config['LIBRARY_CARD_USAGE_OPTION_INDEX'] < len(options_text)):
+                    print("Please select your library card usage option:")
+                    for i, text in enumerate(options_text):
+                        print(f"{i+1}. {text}")
+                    while True:
+                        try:
+                            choice = input("Enter the number of your choice: ")
+                            choice_index = int(choice) - 1
+                            if 0 <= choice_index < len(options_text):
+                                config['LIBRARY_CARD_USAGE_OPTION_INDEX'] = choice_index
+                                save_config(config) # Save the selected index
+                                break
+                            else:
+                                print("Invalid choice. Please enter a number from the list.")
+                        except ValueError:
+                            print("Invalid input. Please enter a number.")
+                else:
+                    print(f"Using saved library card usage option: {options_text[config['LIBRARY_CARD_USAGE_OPTION_INDEX']]}")
+
+                # Click the corresponding button based on the stored/selected index
+                selected_option_text = options_text[config['LIBRARY_CARD_USAGE_OPTION_INDEX']]
+                # Fix: Changed f-string outer quotes to double quotes to resolve SyntaxError
+                page.click(f"button:has-text(\"{selected_option_text}\") >> nth={config['LIBRARY_CARD_USAGE_OPTION_INDEX']}")
+                page.wait_for_load_state('networkidle')
+                time.sleep(3)
+                # Fix: Separated f-string for filename from os.path.join
+                filename = f"07_after_select_card_usage_{config['LIBRARY_CARD_USAGE_OPTION_INDEX']+1}.png"
+                screenshot_path = os.path.join(config['DOWNLOAD_DIRECTORY'], filename)
+                page.screenshot(path=screenshot_path)
+
+            except PlaywrightTimeoutError:
+                print("Error: Library card usage options did not appear in time.")
+                return
+            except Exception as e:
+                print(f"An error occurred while handling library card usage options: {e}")
+                return
+
+            # Enter library card number
+            print(f"Entering library card number: '{config['LIBRARY_CARD_NUMBER']}' into Card Number field...")
+            try:
+                # Using the provided HTML, the input has id="shibui-form-input-control-0002"
+                # and placeholder="Search…". The ID is the most reliable selector.
+                page.fill('#shibui-form-input-control-0002', config['LIBRARY_CARD_NUMBER'])
+                page.wait_for_load_state('networkidle')
+                time.sleep(3) # Give time for search results to load (search happens automatically)
+                page.screenshot(path=os.path.join(config['DOWNLOAD_DIRECTORY'], "08_after_card_number_input.png"))
+            except PlaywrightTimeoutError:
+                print("Error: Could not find or fill the library card number field. "
+                      "Please inspect the selector.")
+                return
+
+            # Click "Next" button
+            print("Clicking 'Next' button...")
+            try:
+                # Using the role and text content for a robust selector
+                page.click('button[role="button"]:has-text("Next")')
+                page.wait_for_load_state('networkidle')
+                time.sleep(2) # Give a moment for the next page to load
+                page.screenshot(path=os.path.join(config['DOWNLOAD_DIRECTORY'], "09_after_card_number_next.png"))
+            except PlaywrightTimeoutError:
+                print("Error: Could not find or click the 'Next' button. "
+                      "The page might have changed or loaded unexpectedly.")
+                return
+
+            # Enter PIN
+            print(f"Entering PIN: '{config['LIBBY_PASSWORD']}' into PIN field...")
+            try:
+                # Using the provided HTML, the input has id="shibui-form-input-control-0003"
+                # and placeholder="Search…". The ID is the most reliable selector.
+                page.fill('#shibui-form-input-control-0003', config['LIBBY_PASSWORD'])
+                page.wait_for_load_state('networkidle')
+                time.sleep(3) # Give time for search results to load (search happens automatically)
+                page.screenshot(path=os.path.join(config['DOWNLOAD_DIRECTORY'], "10_after_pin_input.png"))
+            except PlaywrightTimeoutError:
+                print("Error: Could not find or fill the PIN field. "
+                      "Please inspect the selector.")
+                return
+
+            # Click Sign In button
+            print("Attempting to log in...")
+            try:
+                # Using the role and text content for a robust selector
+                page.click('button[role="button"]:has-text("Sign In")')
+                page.wait_for_load_state('networkidle')
+                time.sleep(2) # Give a moment for the next page to load
+                page.screenshot(path=os.path.join(config['DOWNLOAD_DIRECTORY'], "11_after_final_sign_in.png"))
+            except PlaywrightTimeoutError:
+                print("Error: Could not find or click the 'Sign In' button. "
+                      "The page might have changed or loaded unexpectedly.")
+                return
+
+            # Click "Next" button (This might be a final confirmation after successful login)
+            print("Clicking 'Next' button (post-login confirmation)...")
+            try:
+                # This 'Next' button might appear after successful login to confirm something.
+                # If it doesn't appear, this click will timeout, which is handled.
+                page.click('button[role="button"]:has-text("Next")', timeout=5000) # Shorter timeout for optional button
+                page.wait_for_load_state('networkidle')
+                time.sleep(2)
+                page.screenshot(path=os.path.join(config['DOWNLOAD_DIRECTORY'], "12_after_post_login_next.png"))
+            except PlaywrightTimeoutError:
+                print("No 'Next' button found after login, proceeding.")
+            except Exception as e:
+                print(f"An unexpected error occurred clicking post-login 'Next': {e}")
+
+
+            # Add a generic wait after login, adjust as needed
+            page.wait_for_load_state('networkidle', timeout=60000) # Give more time for login redirect
+            print("Login attempt complete. Checking if logged in...")
+            page.screenshot(path=os.path.join(config['DOWNLOAD_DIRECTORY'], "13_after_login_complete.png"))
+
+            # You might want to add a check here to ensure login was successful,
+            # e.g., by looking for an element that only appears after login.
+            # For now, we'll proceed assuming success.
+
+            # --- Step 2: Navigate to Audiobook ---
+            # Removed hardcoded AUDIOBOOK_TITLE reference
+            print("Navigating to audiobook section...")
+
+            # First, navigate to the "Shelf" or "Loans" section.
+            # Using the provided HTML, the button has id="footer-nav-shelf"
+            print("Clicking 'Shelf' button in footer navigation...")
+            try:
+                page.click('#footer-nav-shelf')
+                page.wait_for_load_state('networkidle')
+                time.sleep(2) # Short pause for UI to settle
+                page.screenshot(path=os.path.join(config['DOWNLOAD_DIRECTORY'], "14_on_shelf_page.png"))
+            except PlaywrightTimeoutError:
+                print("Error: Could not find or click the 'Shelf' button. "
+                      "The footer navigation might have changed or not loaded.")
+                return
+
+            # --- Prompt user for audiobook selection on the shelf ---
+            print("\nAudiobooks on your Shelf:")
+            try:
+                # Wait for audiobook tiles to be visible
+                page.wait_for_selector('.title-list-tiles .title-tile', timeout=15000)
+
+                audiobook_tiles = page.locator('.title-list-tiles .title-tile').all()
+                audiobook_titles = []
+                for i, tile in enumerate(audiobook_tiles):
+                    # Extract the title text from within the tile
+                    title_element = tile.locator('.title-tile-title').first
+                    if title_element:
+                        title_text = title_element.text_content().strip().replace('&nbsp;', ' ')
+                        audiobook_titles.append(title_text)
+
+                # Debug print: Show what titles were parsed
+                print(f"DEBUG: Parsed Audiobook Titles: {audiobook_titles}")
+
+                if not audiobook_titles:
+                    print("No audiobooks found on your shelf.")
+                    return
+
+                # Prompt user for which book on their shelf they want to download.
+                # Print numbered list for user selection
+                for i, title in enumerate(audiobook_titles):
+                    print(f"{i+1}. {title}")
+
+                # Loop until a valid choice is made
+                selected_title = None
+                while selected_title is None:
+                    try:
+                        choice = input("Enter the number of the audiobook to open: ")
+                        choice_index = int(choice) - 1
+                        if 0 <= choice_index < len(audiobook_titles):
+                            selected_title = audiobook_titles[choice_index]
+                            print(f"You selected: '{selected_title}'")
+                        else:
+                            print("Invalid choice. Please enter a number from the list.")
+                    except ValueError:
+                        print("Invalid input. Please enter a number.")
+
+                # Locate the specific audiobook tile using the selected title
+                audiobook_tile_locator = page.locator(f'div.title-tile:has-text("{selected_title}")').first
+                # Click the "Open Audiobook" button within that tile
+                open_audiobook_button_selector = 'button[role="button"]:has-text("Open Audiobook")'
+                audiobook_tile_locator.locator(open_audiobook_button_selector).click()
+                page.wait_for_load_state('networkidle')
+                time.sleep(3)
+                # Fix: Separated f-string for filename from os.path.join
+                filename = f"15_after_open_audiobook_button_{selected_title.replace(' ', '_')}.png"
+                screenshot_path = os.path.join(config['DOWNLOAD_DIRECTORY'], filename)
+                page.screenshot(path=screenshot_path)
+
+            except PlaywrightTimeoutError:
+                print("Error: Audiobook titles did not appear in time on the shelf.")
+                return
+            except Exception as e:
+                print(f"An error occurred while listing/selecting audiobooks: {e}")
+                return
+
+            # Removed the explicit "Click Listen or Play button" step as the user confirmed
+            # the first part loads automatically after navigating to the audiobook detail page.
+            print("Audiobook player opened. Starting part discovery...")
+            time.sleep(5) # Give player time to load initial parts and for network requests to fire
+            page.screenshot(path=os.path.join(config['DOWNLOAD_DIRECTORY'], "16_after_audiobook_detail_load.png"))
+
+
+            # --- Step 3: Player Control and Forward Part Discovery ---
+            # Continuously click "Next Chapter" or "Skip Forward" to trigger new part loads.
+            initial_parts_count = len(downloaded_parts)
+            no_new_parts_count = 0
+            MAX_NO_NEW_PARTS_ITERATIONS = 10 # Stop if no new parts found for this many clicks
+            MAX_FORWARD_CLICKS = 500 # Safety limit for forward clicks
+
+            # Selector for the "Next Chapter" button
+            NEXT_CHAPTER_SELECTOR = 'button.chapter-bar-next-button'
+
+            for i in range(MAX_FORWARD_CLICKS):
+                current_parts_count = len(downloaded_parts)
+                print(f"Forward pass iteration {i+1}. Current parts downloaded: {current_parts_count}")
+
+                try:
+                    # Wait for the next chapter button to be visible and enabled
+                    page.wait_for_selector(NEXT_CHAPTER_SELECTOR, timeout=5000)
+                    page.click(NEXT_CHAPTER_SELECTOR)
+                    time.sleep(3) # Give time for network requests to fire and new parts to be detected
+                except PlaywrightTimeoutError:
+                    print("No 'Next Chapter' button found or end of audiobook reached in forward pass.")
+                    break # Exit loop if button is not found (likely end of book)
+                except Exception as e:
+                    print(f"Error clicking 'Next Chapter' button: {e}")
+                    break # Exit loop on unexpected error
+
+                if len(downloaded_parts) == current_parts_count:
+                    no_new_parts_count += 1
+                    print(f"No new parts detected in this iteration ({no_new_parts_count}/{MAX_NO_NEW_PARTS_ITERATIONS}).")
+                    if no_new_parts_count >= MAX_NO_NEW_PARTS_ITERATIONS:
+                        print("Stopping forward pass: No new parts found for several iterations.")
+                        break
+                else:
+                    no_new_parts_count = 0 # Reset counter if new parts were found
+
+            print(f"Forward pass complete. Total unique parts found: {len(downloaded_parts)}")
+            print(f"Highest part number found: {max_part_number_found}")
+
+            # --- Step 4: Handling Missing Parts (Backward Seeking) ---
+            print("Checking for any missing parts and attempting to retrieve them...")
+            missing_parts = []
+            for i in range(1, max_part_number_found + 1):
+                if i not in downloaded_parts:
+                    missing_parts.append(i)
+
+            if not missing_parts:
+                print("No missing parts detected. All parts downloaded successfully!")
+            else:
+                print(f"Missing parts identified: {sorted(missing_parts)}")
+                # This is the most challenging part due to dynamic player behavior.
+                # The strategy here is to attempt to go back to a chapter that *might*
+                # contain the missing part and let it play briefly.
+                # This often involves repeatedly clicking "Previous Chapter".
+
+                # You MUST inspect the "Previous Chapter" button's selector.
+                # --- PLACEHOLDER: Replace with actual selector for Previous Chapter/Skip Backward ---
+                PREV_CHAPTER_SELECTOR = 'button[aria-label*="Previous chapter"]'
+                # --- END PLACEHOLDER ---
+
+                for missing_part in sorted(missing_parts):
+                    print(f"Attempting to retrieve missing Part {missing_part}...")
+                    retries = 3
+                    for attempt in range(retries):
+                        try:
+                            # A heuristic: Go back a few chapters to try and trigger the part.
+                            # This might need adjustment based on how Libby loads parts.
+                            # For example, if Part 5 is missing, go back to a chapter that
+                            # would contain Part 4 or 3.
+                            for _ in range(2): # Click 'previous chapter' a couple of times
+                                try:
+                                    page.click(PREV_CHAPTER_SELECTOR, timeout=2000)
+                                    time.sleep(1)
+                                except PlaywrightTimeoutError:
+                                    print("Reached beginning of audiobook while seeking backwards.")
+                                    break # Can't go back further
+
+                            print(f"Attempt {attempt + 1} to trigger Part {missing_part} download...")
+                            # Now, play forward a bit or just wait, hoping the missing part loads
+                            # as the player re-buffers.
+                            time.sleep(5) # Give ample time for network requests
+
+                            if missing_part in downloaded_parts:
+                                print(f"Successfully retrieved missing Part {missing_part}!")
+                                break # Move to the next missing part
+                            else:
+                                print(f"Part {missing_part} not found after attempt {attempt + 1}.")
+                        except Exception as e:
+                            print(f"Error during backward seeking for Part {missing_part}: {e}")
+                    if missing_part not in downloaded_parts:
+                        print(f"Failed to retrieve Part {missing_part} after {retries} attempts.")
+
+            print("All download attempts complete.")
+
+        except PlaywrightTimeoutError as e:
+            print(f"Playwright operation timed out: {e}. This often means a selector was not found or a page took too long to load.")
+            print("Please review your selectors and internet connection.")
+        except Exception as e:
+            print(f"An unexpected error occurred: {e}")
+        finally:
+            if browser:
+                print("Closing browser...")
+                browser.close()
+            print("Script finished.")
+
+# --- How to Run ---
+if __name__ == "__main__":
+    # Before running:
+    # 1. Install Playwright and requests:
+    #    pip install playwright requests
+    # 2. Install playwright-stealth:
+    #    pip install playwright-stealth
+    # 3. Ensure Playwright's browser drivers are installed and up-to-date:
+    #    playwright install --with-deps
+    # 4. The script will now prompt you for your LIBRARY_CARD_NUMBER, LIBBY_PASSWORD,
+    #    LIBRARY, DOWNLOAD_DIRECTORY, and LIBRARY_CARD_USAGE_OPTION_INDEX the first time
+    #    it runs, and save them to 'libby_config.json'.
+    # 5. IMPORTANT: Run the script initially with HEADLESS_MODE = False.
+    #    Observe the browser actions and use your browser's developer tools (F12)
+    #    to find the correct CSS selectors or XPath expressions if any issues arise.
+    # 6. The script will continue to prompt you for the AUDIOBOOK_TITLE to download
+    #    each time it is run.
+
+    run()
