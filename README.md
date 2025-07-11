@@ -1,6 +1,6 @@
 # Libby Audiobook Downloader Script
 
-This Python script automates the process of logging into Libby (libbyapp.com), navigating to your bookshelf, selecting an audiobook, and downloading its audio parts. It uses Playwright for browser automation and `playwright-stealth` to help bypass bot detection mechanisms.
+This Python script automates the process of logging into Libby (libbyapp.com), navigating to your bookshelf, selecting an audiobook, and downloading its audio parts. It uses Playwright for browser automation.
 
 ## Features
 
