@@ -33,8 +33,8 @@ def load_config():
         print(f"Configuration file {CONFIG_FILE} not found. Will prompt for details.")
 
     # Check for required fields and prompt if missing
-    # LIBRARY_CARD_USAGE_OPTION_INDEX is added here to be stored in config
-    required_fields = ['LIBRARY_CARD_NUMBER', 'LIBBY_PASSWORD', 'LIBRARY', 'DOWNLOAD_DIRECTORY', 'LIBRARY_CARD_USAGE_OPTION_INDEX']
+    # LIBRARY_CARD_USAGE_OPTION_INDEX and LIBRARY_SEARCH_RESULT_INDEX are handled dynamically in run()
+    required_fields = ['LIBRARY_CARD_NUMBER', 'LIBBY_PASSWORD', 'LIBRARY', 'DOWNLOAD_DIRECTORY']
     for field in required_fields:
         if field not in config or not config[field]:
             if field == 'LIBRARY_CARD_NUMBER':
@@ -46,15 +46,7 @@ def load_config():
             elif field == 'DOWNLOAD_DIRECTORY':
                 default_dir = os.path.join(os.getcwd(), "Libby_Audiobook_Downloads")
                 config[field] = input(f"Enter download directory (default: {default_dir}): ") or default_dir
-            elif field == 'LIBRARY_CARD_USAGE_OPTION_INDEX':
-                # This field will be set later in the run function after options are fetched
-                # For initial load, we'll leave it as None or an empty string, and handle the prompt there.
-                # If it's missing, it will be prompted for during the first run.
-                pass # Handled in run() function where options are dynamically retrieved
-
-            # Save after each new input, except for LIBRARY_CARD_USAGE_OPTION_INDEX which needs dynamic options
-            if field != 'LIBRARY_CARD_USAGE_OPTION_INDEX':
-                save_config(config)
+            save_config(config) # Save after each new input
 
     # Ensure DOWNLOAD_DIRECTORY exists
     if not os.path.exists(config['DOWNLOAD_DIRECTORY']):
@@ -167,7 +159,8 @@ def run():
             print("Navigating to Libby login page...")
             page.goto("https://libbyapp.com/")
             page.wait_for_load_state('networkidle') # Wait for initial page load
-            page.screenshot(path=os.path.join(config['DOWNLOAD_DIRECTORY'], "01_initial_load.png"))
+            screenshot_path = os.path.join(config['DOWNLOAD_DIRECTORY'], "01_initial_load.png")
+            page.screenshot(path=screenshot_path)
 
             # Click "Yes, I Have A Library Card" button
             print("Clicking 'Yes, I Have A Library Card' button...")
@@ -176,7 +169,8 @@ def run():
                 page.click('button[role="button"]:has-text("Yes, I Have A Library Card")')
                 page.wait_for_load_state('networkidle')
                 time.sleep(2) # Give a moment for the next page to load
-                page.screenshot(path=os.path.join(config['DOWNLOAD_DIRECTORY'], "02_after_yes_card.png"))
+                screenshot_path = os.path.join(config['DOWNLOAD_DIRECTORY'], "02_after_yes_card.png")
+                page.screenshot(path=screenshot_path)
             except PlaywrightTimeoutError:
                 print("Error: Could not find or click the 'Yes, I Have A Library Card' button. "
                       "The page might have changed or loaded unexpectedly.")
@@ -189,7 +183,8 @@ def run():
                 page.click('button[role="button"]:has-text("Search For A Library")')
                 page.wait_for_load_state('networkidle')
                 time.sleep(2) # Give a moment for the next page to load
-                page.screenshot(path=os.path.join(config['DOWNLOAD_DIRECTORY'], "03_after_search_library.png"))
+                screenshot_path = os.path.join(config['DOWNLOAD_DIRECTORY'], "03_after_search_library.png")
+                page.screenshot(path=screenshot_path)
             except PlaywrightTimeoutError:
                 print("Error: Could not find or click the 'Search For A Library' button. "
                       "The page might have changed or loaded unexpectedly.")
@@ -202,24 +197,71 @@ def run():
                 # and placeholder="Search…". The ID is the most reliable selector.
                 page.fill('#shibui-form-input-control-0001', config['LIBRARY'])
                 page.wait_for_load_state('networkidle')
-                time.sleep(3) # Give time for search results to load (search happens automatically)
-                page.screenshot(path=os.path.join(config['DOWNLOAD_DIRECTORY'], "04_after_library_search_input.png"))
+                time.sleep(3) # Give time for search results to load
+                screenshot_path = os.path.join(config['DOWNLOAD_DIRECTORY'], "04_after_library_search_input.png")
+                page.screenshot(path=screenshot_path)
             except PlaywrightTimeoutError:
                 print("Error: Could not find or fill the library search input field. "
                       "Please inspect the selector.")
                 return
 
-            # Click on the top search result for the library
-            print("Clicking on the top search result for the library...")
+            # --- Poll user for library selection from search results ---
+            print("\nSearching for your library...")
             try:
-                # Fix: Changed f-string outer quotes to double quotes to resolve SyntaxError
-                page.click(f"text=\"{config['LIBRARY']}\" >> nth=0")
+                # Wait for search results to appear.
+                # The HTML shows div.SearchForLibrary-result elements.
+                page.wait_for_selector('div.SearchForLibrary-result', timeout=15000)
+
+                library_result_elements = page.locator('div.SearchForLibrary-result').all()
+                library_names = []
+                for i, element in enumerate(library_result_elements):
+                    # Extract the text from the span with role="text" inside each result div
+                    name_element = element.locator('span[role="text"]').first
+                    if name_element:
+                        name_text = name_element.text_content().strip()
+                        if name_text:
+                            library_names.append(name_text)
+
+                if not library_names:
+                    print("No libraries found matching your search term.")
+                    return
+
+                print("Found the following libraries:")
+                for i, name in enumerate(library_names):
+                    print(f"{i+1}. {name}")
+
+                # If the option index is not in config or invalid, prompt the user
+                if 'LIBRARY_SEARCH_RESULT_INDEX' not in config or \
+                   not (0 <= config['LIBRARY_SEARCH_RESULT_INDEX'] < len(library_names)):
+                    while True:
+                        try:
+                            choice = input("Enter the number of your library from the list: ")
+                            choice_index = int(choice) - 1
+                            if 0 <= choice_index < len(library_names):
+                                config['LIBRARY_SEARCH_RESULT_INDEX'] = choice_index
+                                save_config(config) # Save the selected index
+                                break
+                            else:
+                                print("Invalid choice. Please enter a number from the list.")
+                        except ValueError:
+                            print("Invalid input. Please enter a number.")
+                else:
+                    print(f"Using saved library search result option: {library_names[config['LIBRARY_SEARCH_RESULT_INDEX']]}")
+
+                # Click the corresponding library result
+                # We use the locator directly with nth() to click the specific element
+                library_result_elements[config['LIBRARY_SEARCH_RESULT_INDEX']].click()
                 page.wait_for_load_state('networkidle')
-                time.sleep(3) # Give time for the page to load after selecting library
-                page.screenshot(path=os.path.join(config['DOWNLOAD_DIRECTORY'], "05_after_select_library.png"))
+                time.sleep(3)
+                screenshot_filename = f"05_after_select_library_from_results_{config['LIBRARY_SEARCH_RESULT_INDEX']+1}.png"
+                screenshot_path = os.path.join(config['DOWNLOAD_DIRECTORY'], screenshot_filename)
+                page.screenshot(path=screenshot_path)
+
             except PlaywrightTimeoutError:
-                print("Error: Could not find or click the top search result for the library. "
-                      "Please inspect the selector.")
+                print("Error: Library search results did not appear in time or selector is incorrect.")
+                return
+            except Exception as e:
+                print(f"An error occurred while selecting library from search results: {e}")
                 return
 
             # Click "Sign In With My Card" button
@@ -229,7 +271,8 @@ def run():
                 page.click('button[role="button"]:has-text("Sign In With My Card")')
                 page.wait_for_load_state('networkidle')
                 time.sleep(2) # Give a moment for the next page to load
-                page.screenshot(path=os.path.join(config['DOWNLOAD_DIRECTORY'], "06_after_sign_in_with_card.png"))
+                screenshot_path = os.path.join(config['DOWNLOAD_DIRECTORY'], "06_after_sign_in_with_card.png")
+                page.screenshot(path=screenshot_path)
             except PlaywrightTimeoutError:
                 print("Error: Could not find or click the 'Sign In With My Card' button. "
                       "The page might have changed or loaded unexpectedly.")
@@ -301,7 +344,8 @@ def run():
                 page.fill('#shibui-form-input-control-0002', config['LIBRARY_CARD_NUMBER'])
                 page.wait_for_load_state('networkidle')
                 time.sleep(3) # Give time for search results to load (search happens automatically)
-                page.screenshot(path=os.path.join(config['DOWNLOAD_DIRECTORY'], "08_after_card_number_input.png"))
+                screenshot_path = os.path.join(config['DOWNLOAD_DIRECTORY'], "08_after_card_number_input.png")
+                page.screenshot(path=screenshot_path)
             except PlaywrightTimeoutError:
                 print("Error: Could not find or fill the library card number field. "
                       "Please inspect the selector.")
@@ -314,7 +358,8 @@ def run():
                 page.click('button[role="button"]:has-text("Next")')
                 page.wait_for_load_state('networkidle')
                 time.sleep(2) # Give a moment for the next page to load
-                page.screenshot(path=os.path.join(config['DOWNLOAD_DIRECTORY'], "09_after_card_number_next.png"))
+                screenshot_path = os.path.join(config['DOWNLOAD_DIRECTORY'], "09_after_card_number_next.png")
+                page.screenshot(path=screenshot_path)
             except PlaywrightTimeoutError:
                 print("Error: Could not find or click the 'Next' button. "
                       "The page might have changed or loaded unexpectedly.")
@@ -328,7 +373,8 @@ def run():
                 page.fill('#shibui-form-input-control-0003', config['LIBBY_PASSWORD'])
                 page.wait_for_load_state('networkidle')
                 time.sleep(3) # Give time for search results to load (search happens automatically)
-                page.screenshot(path=os.path.join(config['DOWNLOAD_DIRECTORY'], "10_after_pin_input.png"))
+                screenshot_path = os.path.join(config['DOWNLOAD_DIRECTORY'], "10_after_pin_input.png")
+                page.screenshot(path=screenshot_path)
             except PlaywrightTimeoutError:
                 print("Error: Could not find or fill the PIN field. "
                       "Please inspect the selector.")
@@ -341,7 +387,8 @@ def run():
                 page.click('button[role="button"]:has-text("Sign In")')
                 page.wait_for_load_state('networkidle')
                 time.sleep(2) # Give a moment for the next page to load
-                page.screenshot(path=os.path.join(config['DOWNLOAD_DIRECTORY'], "11_after_final_sign_in.png"))
+                screenshot_path = os.path.join(config['DOWNLOAD_DIRECTORY'], "11_after_final_sign_in.png")
+                page.screenshot(path=screenshot_path)
             except PlaywrightTimeoutError:
                 print("Error: Could not find or click the 'Sign In' button. "
                       "The page might have changed or loaded unexpectedly.")
@@ -355,7 +402,8 @@ def run():
                 page.click('button[role="button"]:has-text("Next")', timeout=5000) # Shorter timeout for optional button
                 page.wait_for_load_state('networkidle')
                 time.sleep(2)
-                page.screenshot(path=os.path.join(config['DOWNLOAD_DIRECTORY'], "12_after_post_login_next.png"))
+                screenshot_path = os.path.join(config['DOWNLOAD_DIRECTORY'], "12_after_post_login_next.png")
+                page.screenshot(path=screenshot_path)
             except PlaywrightTimeoutError:
                 print("No 'Next' button found after login, proceeding.")
             except Exception as e:
@@ -365,7 +413,8 @@ def run():
             # Add a generic wait after login, adjust as needed
             page.wait_for_load_state('networkidle', timeout=60000) # Give more time for login redirect
             print("Login attempt complete. Checking if logged in...")
-            page.screenshot(path=os.path.join(config['DOWNLOAD_DIRECTORY'], "13_after_login_complete.png"))
+            screenshot_path = os.path.join(config['DOWNLOAD_DIRECTORY'], "13_after_login_complete.png")
+            page.screenshot(path=screenshot_path)
 
             # You might want to add a check here to ensure login was successful,
             # e.g., by looking for an element that only appears after login.
@@ -382,7 +431,8 @@ def run():
                 page.click('#footer-nav-shelf')
                 page.wait_for_load_state('networkidle')
                 time.sleep(2) # Short pause for UI to settle
-                page.screenshot(path=os.path.join(config['DOWNLOAD_DIRECTORY'], "14_on_shelf_page.png"))
+                screenshot_path = os.path.join(config['DOWNLOAD_DIRECTORY'], "14_on_shelf_page.png")
+                page.screenshot(path=screenshot_path)
             except PlaywrightTimeoutError:
                 print("Error: Could not find or click the 'Shelf' button. "
                       "The footer navigation might have changed or not loaded.")
@@ -452,7 +502,8 @@ def run():
             # the first part loads automatically after navigating to the audiobook detail page.
             print("Audiobook player opened. Starting part discovery...")
             time.sleep(5) # Give player time to load initial parts and for network requests to fire
-            page.screenshot(path=os.path.join(config['DOWNLOAD_DIRECTORY'], "16_after_audiobook_detail_load.png"))
+            screenshot_path = os.path.join(config['DOWNLOAD_DIRECTORY'], "16_after_audiobook_detail_load.png")
+            page.screenshot(path=screenshot_path)
 
 
             # --- Step 3: Player Control and Forward Part Discovery ---
@@ -556,6 +607,7 @@ def run():
         finally:
             if browser:
                 print("Closing browser...")
+                breakpoint()
                 browser.close()
             print("Script finished.")
 
