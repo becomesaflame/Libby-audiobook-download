@@ -69,46 +69,67 @@ def handle_request(request):
     """
     global downloaded_parts, max_part_number_found
 
-    url = request.url
-    # print(f"Intercepting network request for url: {url}") # Uncomment for verbose request logging
+    # First, try to extract the part number from the INITIAL request URL.
+    # This URL contains the "PartXX.mp3" string before any redirects.
+    part_match = re.search(r"Part(\d+).mp3", request.url, re.IGNORECASE)
+    
+    if not part_match:
+        # If it's not an audiobook part request, we can skip it.
+        # print(f"Skipping non-audiobook part request (no PartXX.mp3 in initial URL): {request.url}")
+        return
+    else:
+        breakpoint()
 
-    # Filter requests for MP3 parts based on observed patterns
-    # (contains "Part")
-    if "Part" in url:
-        part_match = re.search(r"Part(\d+).mp3", url, re.IGNORECASE)
-        if part_match:
-            part_number = int(part_match.group(1))
+    part_number = int(part_match.group(1))
 
-            if part_number not in downloaded_parts:
-                print(f"Detected new part: {url} (Part {part_number})")
-                file_name = f"Part_{part_number:02d}.mp3" # e.g., Part_01.mp3, Part_10.mp3
-                # Use the DOWNLOAD_DIRECTORY from the loaded config
-                file_path = os.path.join(config['DOWNLOAD_DIRECTORY'], file_name)
+    # Get the response object for the intercepted request.
+    # This will wait for the response and automatically follow redirects.
+    response = request.response()
 
-                try:
-                    # Get the response object for the intercepted request
-                    # Playwright automatically follows redirects, so this response
-                    # should be for the final MP3 content from the CDN.
-                    response = request.response()
-                    if response and response.status == 200:
-                        # Get the body directly from Playwright's response.
-                        # This ensures all browser context (cookies, referer, etc.) is used.
-                        content = response.body()
+    if not response:
+        print(f"No response object for request (Part {part_number}): {request.url}")
+        return
 
-                        with open(file_path, "wb") as f:
-                            f.write(content)
+    final_url = response.url # This is the URL after all redirects
 
-                        print(f"Successfully downloaded {file_name}")
-                        downloaded_parts.add(part_number)
-                        max_part_number_found = max(max_part_number_found, part_number)
-                    else:
-                        print(f"Failed to get successful response for {url}. Status: {response.status if response else 'No Response'}")
+    # Now, check if the FINAL response URL is from the CDN.
+    # This confirms it's the actual audio content.
+    if "audioclips.cdn.overdrive.com" in final_url:
+        breakpoint()
+        if part_number not in downloaded_parts:
+            print(f"Detected new part from CDN: {final_url} (Part {part_number}) [Original Request: {request.url}]")
+            file_name = f"Part_{part_number:02d}.mp3" # e.g., Part_01.mp3, Part_10.mp3
+            file_path = os.path.join(config['DOWNLOAD_DIRECTORY'], file_name)
 
-                except Exception as e:
-                    print(f"An unexpected error occurred during download of {file_name} from {url}: {e}")
-            else:
-                # print(f"Part {part_number} already downloaded, skipping.") # Uncomment for verbose logging
-                pass
+            try:
+                print(f"  Response Status: {response.status}")
+                print(f"  Response Headers: {response.headers}")
+                
+                content = response.body()
+                content_length = len(content)
+                print(f"  Response Body Size: {content_length} bytes")
+
+                if response.status == 200 and content_length > 0:
+                    with open(file_path, "wb") as f:
+                        f.write(content)
+
+                    print(f"Successfully downloaded {file_name} ({content_length} bytes)")
+                    downloaded_parts.add(part_number)
+                    max_part_number_found = max(max_part_number_found, part_number)
+                else:
+                    print(f"Failed to download {file_name}. Status: {response.status}, Body Size: {content_length} bytes.")
+                    if response.status == 403:
+                        print("  (403 Forbidden: Access denied. This might indicate an issue with session or token.)")
+                    elif content_length == 0:
+                        print("  (Empty response body received. This is unexpected for an actual audio part.)")
+            except Exception as e:
+                print(f"An unexpected error occurred during download of {file_name} from {final_url}: {e}")
+        else:
+            # print(f"Part {part_number} already downloaded, skipping.") # Uncomment for verbose logging
+            pass
+    # else:
+        # print(f"Skipping non-CDN audio part request (Part {part_number}): {final_url}") # Uncomment for verbose logging
+
 
 # Global variable for configuration (will be loaded in run())
 config = {}
@@ -165,8 +186,8 @@ def run():
             # Click "Yes, I Have A Library Card" button
             print("Clicking 'Yes, I Have A Library Card' button...")
             try:
-                # Using the role and text content for a robust selector
-                page.click('button[role="button"]:has-text("Yes, I Have A Library Card")')
+                # Using triple double quotes for robustness
+                page.click("""button[role="button"]:has-text("Yes, I Have A Library Card")""")
                 page.wait_for_load_state('networkidle')
                 time.sleep(2) # Give a moment for the next page to load
                 screenshot_path = os.path.join(config['DOWNLOAD_DIRECTORY'], "02_after_yes_card.png")
@@ -179,8 +200,8 @@ def run():
             # Click "Search For A Library" button
             print("Clicking 'Search For A Library' button...")
             try:
-                # Using the role and text content for a robust selector
-                page.click('button[role="button"]:has-text("Search For A Library")')
+                # Using triple double quotes for robustness
+                page.click("""button[role="button"]:has-text("Search For A Library")""")
                 page.wait_for_load_state('networkidle')
                 time.sleep(2) # Give a moment for the next page to load
                 screenshot_path = os.path.join(config['DOWNLOAD_DIRECTORY'], "03_after_search_library.png")
@@ -277,8 +298,8 @@ def run():
             # Click "Sign In With My Card" button
             print("Clicking 'Sign In With My Card' button...")
             try:
-                # Using the role and text content for a robust selector
-                page.click('button[role="button"]:has-text("Sign In With My Card")')
+                # Using triple double quotes for robustness
+                page.click("""button[role="button"]:has-text("Sign In With My Card")""")
                 page.wait_for_load_state('networkidle')
                 time.sleep(2) # Give a moment for the next page to load
                 screenshot_path = os.path.join(config['DOWNLOAD_DIRECTORY'], "06_after_sign_in_with_card.png")
@@ -330,8 +351,8 @@ def run():
 
                 # Click the corresponding button based on the stored/selected index
                 selected_option_text = options_text[config['LIBRARY_CARD_USAGE_OPTION_INDEX']]
-                # Fix: Changed f-string outer quotes to double quotes to resolve SyntaxError
-                page.click(f"button:has-text(\"{selected_option_text}\") >> nth={config['LIBRARY_CARD_USAGE_OPTION_INDEX']}")
+                # Using triple double quotes for robustness in f-string
+                page.click(f"""button:has-text("{selected_option_text}") >> nth={config['LIBRARY_CARD_USAGE_OPTION_INDEX']}""")
                 page.wait_for_load_state('networkidle')
                 time.sleep(3)
                 # Fix: Separated f-string for filename from os.path.join
@@ -364,8 +385,8 @@ def run():
             # Click "Next" button
             print("Clicking 'Next' button...")
             try:
-                # Using the role and text content for a robust selector
-                page.click('button[role="button"]:has-text("Next")')
+                # Using triple double quotes for robustness
+                page.click("""button[role="button"]:has-text("Next")""")
                 page.wait_for_load_state('networkidle')
                 time.sleep(2) # Give a moment for the next page to load
                 screenshot_path = os.path.join(config['DOWNLOAD_DIRECTORY'], "09_after_card_number_next.png")
@@ -393,8 +414,8 @@ def run():
             # Click Sign In button
             print("Attempting to log in...")
             try:
-                # Using the role and text content for a robust selector
-                page.click('button[role="button"]:has-text("Sign In")')
+                # Using triple double quotes for robustness
+                page.click("""button[role="button"]:has-text("Sign In")""")
                 page.wait_for_load_state('networkidle')
                 time.sleep(2) # Give a moment for the next page to load
                 screenshot_path = os.path.join(config['DOWNLOAD_DIRECTORY'], "11_after_final_sign_in.png")
@@ -407,9 +428,8 @@ def run():
             # Click "Next" button (This might be a final confirmation after successful login)
             print("Clicking 'Next' button (post-login confirmation)...")
             try:
-                # This 'Next' button might appear after successful login to confirm something.
-                # If it doesn't appear, this click will timeout, which is handled.
-                page.click('button[role="button"]:has-text("Next")', timeout=5000) # Shorter timeout for optional button
+                # Using triple double quotes for robustness
+                page.click("""button[role="button"]:has-text("Next")""", timeout=5000) # Shorter timeout for optional button
                 page.wait_for_load_state('networkidle')
                 time.sleep(2)
                 screenshot_path = os.path.join(config['DOWNLOAD_DIRECTORY'], "12_after_post_login_next.png")
@@ -490,9 +510,11 @@ def run():
                         print("Invalid input. Please enter a number.")
 
                 # Locate the specific audiobook tile using the selected title
-                audiobook_tile_locator = page.locator(f'div.title-tile:has-text("{selected_title}")').first
+                # Using triple double quotes for robustness in f-string
+                audiobook_tile_locator = page.locator(f"""div.title-tile:has-text("{selected_title}")""").first
                 # Click the "Open Audiobook" button within that tile
-                open_audiobook_button_selector = 'button[role="button"]:has-text("Open Audiobook")'
+                # Using triple double quotes for robustness
+                open_audiobook_button_selector = """button[role="button"]:has-text("Open Audiobook")"""
                 audiobook_tile_locator.locator(open_audiobook_button_selector).click()
                 page.wait_for_load_state('networkidle')
                 time.sleep(3)
@@ -571,8 +593,8 @@ def run():
                 # This often involves repeatedly clicking "Previous Chapter".
 
                 # You MUST inspect the "Previous Chapter" button's selector.
-                # --- PLACEHOLDER: Replace with actual selector for Previous Chapter/Skip Backward ---
-                PREV_CHAPTER_SELECTOR = 'button[aria-label*="Previous chapter"]'
+                # Using triple double quotes for robustness
+                PREV_CHAPTER_SELECTOR = """button[aria-label*="Previous chapter"]"""
                 # --- END PLACEHOLDER ---
 
                 for missing_part in sorted(missing_parts):
