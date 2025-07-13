@@ -209,18 +209,28 @@ def run():
             print("\nSearching for your library...")
             try:
                 # Wait for search results to appear.
-                # The HTML shows div.SearchForLibrary-result elements.
-                page.wait_for_selector('div.SearchForLibrary-result', timeout=15000)
+                # The HTML shows button.library-autocomplete-result elements.
+                page.wait_for_selector('button.library-autocomplete-result', timeout=15000)
 
-                library_result_elements = page.locator('div.SearchForLibrary-result').all()
+                library_result_elements = page.locator('button.library-autocomplete-result').all()
                 library_names = []
                 for i, element in enumerate(library_result_elements):
-                    # Extract the text from the span with role="text" inside each result div
-                    name_element = element.locator('span[role="text"]').first
-                    if name_element:
-                        name_text = name_element.text_content().strip()
-                        if name_text:
-                            library_names.append(name_text)
+                    # Extract the text from h2 (system name) and h3 (branch name)
+                    system_name_element = element.locator('h2.library-branch-details-system-name').first
+                    branch_name_element = element.locator('h3.library-branch-details-branch-name').first
+
+                    full_name = ""
+                    if system_name_element:
+                        full_name += system_name_element.text_content().strip()
+                    if branch_name_element:
+                        branch_text = branch_name_element.text_content().strip()
+                        if full_name and branch_text: # If both exist, combine with a separator
+                            full_name += f" ({branch_text})"
+                        elif branch_text: # If only branch name exists
+                            full_name += branch_text
+
+                    if full_name:
+                        library_names.append(full_name)
 
                 if not library_names:
                     print("No libraries found matching your search term.")
