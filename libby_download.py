@@ -12,6 +12,7 @@ CONFIG_FILE = 'libby_config.json'
 # --- Global Variables for Tracking Download Progress ---
 downloaded_parts = set()
 max_part_number_found = 0
+part_number = 00
 # Note: In a single-threaded sync_playwright script, this might not be strictly necessary
 # for these simple variables, but it's good practice for shared state in async contexts
 # or if more complex threading was introduced. For this script, we'll rely on the
@@ -67,37 +68,30 @@ def handle_request(request):
     Callback function to process intercepted network requests.
     Identifies and downloads audiobook MP3 parts directly using Playwright's response.
     """
-    global downloaded_parts, max_part_number_found
+    global downloaded_parts, max_part_number_found, part_number
 
-    # First, try to extract the part number from the INITIAL request URL.
+    url = request.url
+
+    # if this is the initial request URL, extract the part number.
     # This URL contains the "PartXX.mp3" string before any redirects.
-    part_match = re.search(r"Part(\d+).mp3", request.url, re.IGNORECASE)
+    part_match = re.search(r"Part(\d+).mp3", url, re.IGNORECASE)
     
-    if not part_match:
-        # If it's not an audiobook part request, we can skip it.
-        # print(f"Skipping non-audiobook part request (no PartXX.mp3 in initial URL): {request.url}")
+    if part_match:
+        part_number = int(part_match.group(1))
         return
-    else:
-        breakpoint()
-
-    part_number = int(part_match.group(1))
 
     # Get the response object for the intercepted request.
-    # This will wait for the response and automatically follow redirects.
     response = request.response()
 
     if not response:
         print(f"No response object for request (Part {part_number}): {request.url}")
         return
 
-    final_url = response.url # This is the URL after all redirects
-
-    # Now, check if the FINAL response URL is from the CDN.
+    # Otherwise, check if the FINAL response URL is from the CDN.
     # This confirms it's the actual audio content.
-    if "audioclips.cdn.overdrive.com" in final_url:
-        breakpoint()
+    if "audioclips.cdn.overdrive.com" in url:
         if part_number not in downloaded_parts:
-            print(f"Detected new part from CDN: {final_url} (Part {part_number}) [Original Request: {request.url}]")
+            print(f"Detected new part from CDN: {url} (Part {part_number}) [Original Request: {request.url}]")
             file_name = f"Part_{part_number:02d}.mp3" # e.g., Part_01.mp3, Part_10.mp3
             file_path = os.path.join(config['DOWNLOAD_DIRECTORY'], file_name)
 
@@ -108,7 +102,6 @@ def handle_request(request):
                 content = response.body()
                 content_length = len(content)
                 print(f"  Response Body Size: {content_length} bytes")
-
                 if response.status == 200 and content_length > 0:
                     with open(file_path, "wb") as f:
                         f.write(content)
@@ -123,12 +116,12 @@ def handle_request(request):
                     elif content_length == 0:
                         print("  (Empty response body received. This is unexpected for an actual audio part.)")
             except Exception as e:
-                print(f"An unexpected error occurred during download of {file_name} from {final_url}: {e}")
+                print(f"An unexpected error occurred during download of {file_name} from {url}: {e}")
         else:
             # print(f"Part {part_number} already downloaded, skipping.") # Uncomment for verbose logging
             pass
     # else:
-        # print(f"Skipping non-CDN audio part request (Part {part_number}): {final_url}") # Uncomment for verbose logging
+        # print(f"Skipping non-CDN audio part request (Part {part_number}): {url}") # Uncomment for verbose logging
 
 
 # Global variable for configuration (will be loaded in run())
@@ -556,7 +549,7 @@ def run():
                     # Wait for the next chapter button to be visible and enabled
                     page.wait_for_selector(NEXT_CHAPTER_SELECTOR, timeout=5000)
                     page.click(NEXT_CHAPTER_SELECTOR)
-                    time.sleep(3) # Give time for network requests to fire and new parts to be detected
+                    time.sleep(30) # Give time for network requests to fire and new parts to be detected
                 except PlaywrightTimeoutError:
                     print("No 'Next Chapter' button found or end of audiobook reached in forward pass.")
                     break # Exit loop if button is not found (likely end of book)
@@ -639,7 +632,6 @@ def run():
         finally:
             if browser:
                 print("Closing browser...")
-                breakpoint()
                 browser.close()
             print("Script finished.")
 
