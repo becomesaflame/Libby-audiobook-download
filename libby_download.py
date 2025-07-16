@@ -65,24 +65,27 @@ def save_config(config_data):
 def handle_request(request):
     """
     Callback function to process intercepted network requests.
-    Identifies and downloads audiobook MP3 parts directly using Playwright's response.
+    Identifies and downloads audiobook MP3 parts directly using requests library.
     """
     global downloaded_parts, max_part_number_found, active_downloads_count, _latest_libby_part_number_trigger
 
     # Case 1: Intercept initial Libby part request (contains PartXX.mp3)
+    # This request triggers the playback and sets up the session for the CDN download.
     if "listen.libbyapp.com" in request.url:
         part_match = re.search(r"Part(\d+).mp3", request.url, re.IGNORECASE)
         if part_match:
             part_number = int(part_match.group(1))
-            _latest_libby_part_number_trigger = part_number
-            print(f"Detected Libby part trigger: {request.url} -> Setting latest part number to {part_number}")
+            with active_downloads_lock: # Protect access to global trigger variable
+                _latest_libby_part_number_trigger = part_number
+            print(f"Detected Libby part trigger: {request.url} -> Set _latest_libby_part_number_trigger to {part_number}")
             # Do NOT attempt to get response body here, as it's typically empty or a redirect trigger.
-            return
+            # We are just capturing the part number for the subsequent CDN request.
+            return # Exit early, this request is just a trigger
 
     # Case 2: Intercept actual CDN audio request (does NOT contain PartXX.mp3, relies on previous trigger)
     elif "audioclips.cdn.overdrive.com" in request.url:
         if _latest_libby_part_number_trigger is None:
-            print(f"Skipping CDN request {request.url}: No preceding Libby part trigger found.")
+            print(f"Skipping CDN request {request.url}: No preceding Libby part trigger found. This might be an unrelated CDN asset.")
             return
 
         part_number = _latest_libby_part_number_trigger
@@ -91,55 +94,71 @@ def handle_request(request):
         if part_number in downloaded_parts:
             # print(f"Part {part_number} already downloaded, skipping CDN request: {request.url}")
             return
-
-        response = request.response() # This will get the response for the CDN audio file itself
-
-        if not response:
-            print(f"No response object for CDN audio request (derived Part {part_number}): {request.url}")
+        
+        # Get the final URL from the Playwright response object.
+        # This ensures we have the correct, potentially redirected, CDN URL.
+        response_pw = request.response() 
+        if not response_pw:
+            print(f"No Playwright response object for CDN audio request (derived Part {part_number}): {request.url}")
             return
 
-        # Basic check for media content type
-        content_type = response.headers.get("content-type", "")
-        if not content_type.startswith("audio/") and not content_type.startswith("video/"): # Video is also possible for some streams
-            # print(f"Skipping non-audio CDN request (content-type: {content_type}): {request.url}")
+        cdn_audio_url = response_pw.url # Use the final URL from Playwright's response
+
+        # Basic check for media content type from Playwright's response headers
+        content_type = response_pw.headers.get("content-type", "")
+        if not content_type.startswith("audio/") and not content_type.startswith("video/"):
+            print(f"Skipping non-audio CDN request (content-type: {content_type}): {cdn_audio_url}")
             return
 
-        # Proceed with download for the derived part_number
-        print(f"Detected CDN audio for derived Part {part_number}: {request.url}")
+        # Proceed with download for the derived part_number using requests library
+        print(f"Processing CDN audio for derived Part {part_number}: {cdn_audio_url}")
         file_name = f"Part_{part_number:02d}.mp3"
         file_path = os.path.join(config['DOWNLOAD_DIRECTORY'], file_name)
 
         with active_downloads_lock:
             active_downloads_count += 1
+        print(f"  Incremented active_downloads_count to: {active_downloads_count}")
 
         try:
-            print(f"  Response Status: {response.status}")
-            print(f"  Response Headers: {response.headers}")
-            
-            breakpoint()
-            content = response.body()
-            content_length = len(content)
-            print(f"  Response Body Size: {content_length} bytes")
+            print(f"  Making direct requests.get() call for Part {part_number} to {cdn_audio_url}...")
+            # Use requests.get() to download the content directly
+            # Add headers from the original request to ensure session/auth is carried over if needed
+            # Set a timeout for the requests call to prevent indefinite hangs
+            download_response = requests.get(cdn_audio_url, headers=request.headers, timeout=60) # 60 seconds timeout
 
-            if response.status == 200 and content_length > 0:
+            content_length = len(download_response.content)
+            print(f"  Requests.get() Response Body Size: {content_length} bytes for Part {part_number}")
+            print(f"  Requests.get() Response Status: {download_response.status_code}")
+            print(f"  Requests.get() Response Headers: {download_response.headers}")
+
+            if download_response.status_code == 200 and content_length > 0:
                 with open(file_path, "wb") as f:
-                    f.write(content)
+                    f.write(download_response.content)
 
                 print(f"Successfully downloaded {file_name} ({content_length} bytes)")
                 downloaded_parts.add(part_number)
                 max_part_number_found = max(max_part_number_found, part_number)
-                _latest_libby_part_number_trigger = None # Reset after successful download of a part
+                
+                # Reset the trigger AFTER successfully downloading the corresponding CDN part
+                with active_downloads_lock:
+                    _latest_libby_part_number_trigger = None 
+                    print(f"  Reset _latest_libby_part_number_trigger to None after Part {part_number} download.")
             else:
-                print(f"Failed to download {file_name}. Status: {response.status}, Body Size: {content_length} bytes.")
-                if response.status == 403:
+                print(f"Failed to download {file_name}. Status: {download_response.status_code}, Body Size: {content_length} bytes.")
+                if download_response.status_code == 403:
                     print("  (403 Forbidden: Access denied. This might indicate an issue with session or token.)")
                 elif content_length == 0:
                     print("  (Empty response body received. This is unexpected for an actual audio part.)")
+        except requests.exceptions.Timeout:
+            print(f"  TimeoutError: requests.get() for Part {part_number} did not finish within 60 seconds.")
+        except requests.exceptions.RequestException as e:
+            print(f"  Requests Error: An error occurred during requests.get() for Part {part_number}: {e}")
         except Exception as e:
-            print(f"An unexpected error occurred during download of {file_name} from {request.url}: {e}")
+            print(f"An unexpected error occurred during download of {file_name} from {cdn_audio_url}: {e}")
         finally:
             with active_downloads_lock:
                 active_downloads_count -= 1
+            print(f"  Decremented active_downloads_count to: {active_downloads_count}")
     # else:
     #     # Uncomment the line below for verbose debugging of all requests
     #     # print(f"Skipping unrelated request: {request.url}")
@@ -537,7 +556,7 @@ def run():
                 try:
                     page.wait_for_selector(NEXT_CHAPTER_SELECTOR, timeout=5000)
                     page.click(NEXT_CHAPTER_SELECTOR)
-                    time.sleep(30) # Give time for network requests to fire and new parts to be detected
+                    time.sleep(5) # Reduced sleep time here
                 except PlaywrightTimeoutError:
                     print("No 'Next Chapter' button found or end of audiobook reached in forward pass.")
                     break # Exit loop if button is not found (likely end of book)
@@ -617,7 +636,7 @@ def run():
         finally:
             if browser:
                 print("Closing browser...")
-                browser.close()
+                # browser.close()
             print("Script finished.")
 
 # --- How to Run ---
