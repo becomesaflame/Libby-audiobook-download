@@ -62,6 +62,12 @@ Before running the script, ensure you have the following installed:
 
     This command will install Chromium and its necessary dependencies.
 
+7.  **Install Playwright chrome browser**:
+
+    ```bash
+    playwright install chrome
+    ```
+
 ## Usage
 
 1.  **Run the script from your activated virtual environment**:

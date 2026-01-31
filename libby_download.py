@@ -555,39 +555,115 @@ def run():
             MAX_NO_NEW_PARTS_ITERATIONS = 10 # Stop if no new parts found for this many clicks
             MAX_FORWARD_CLICKS = 500 # Safety limit for forward clicks
 
-            # Selector for forward navigation - use "skip ahead 15 seconds" button
+            # Selector for forward navigation - "Next Chapter" button (aria-label e.g. "Next Chapter . 12 minutes ahead.")
+            # Minutes value varies by chapter, so match only the fixed part of the label.
             FORWARD_SELECTORS = [
-                'button.mini-player-jump-ahead',  # The skip ahead 15s button
-                'button[aria-label="Advance 15 seconds"]',  # Exact aria-label match
-                'button[aria-label*="Advance"]',  # Partial aria-label match
-                'button[aria-label*="15 seconds"]',  # Partial aria-label match
-                'button:has-text("15")',  # Button containing "15"
-                'button.chapter-bar-next-button',  # Fallback to original
-                'button[aria-label*="next"]',
-                'button[aria-label*="Next"]'
+                'button[aria-label*="Next Chapter"]',  # Next chapter (label varies: "Next Chapter . N minutes ahead.")
+                'button.chapter-bar-next-button',
+                'button[aria-label*="next chapter"]',
+                'button[aria-label*="Advance 15 seconds"]',  # Fallback: 15s skip
+                'button.mini-player-jump-ahead',
             ]
 
             for i in range(MAX_FORWARD_CLICKS):
                 current_parts_count = len(downloaded_parts)
                 print(f"Forward pass iteration {i+1}. Current parts downloaded: {current_parts_count}")
 
-                # Try multiple selectors to find the forward button (15s skip ahead)
+                # Try to find the "Next Chapter" button (advances to next part; label e.g. "Next Chapter . 12 minutes ahead.")
+                # The Libby player runs in an iframe (listen.libbyapp.com); the button is inside it at index 12.
                 button_found = False
-                for selector in FORWARD_SELECTORS:
-                    try:
-                        page.wait_for_selector(selector, timeout=2000)
-                        print(f"Found forward button with selector: {selector}")
-                        page.click(selector)
-                        button_found = True
 
-                        if button_found:
-                            time.sleep(5) # Reduced sleep time here
-                            break
-                    except PlaywrightTimeoutError:
-                        continue # Try next selector
+                # First: target the Libby player iframe and click Next Chapter (aria-label contains "Next Chapter", minutes vary)
+                try:
+                    player_frame = page.frame_locator('iframe[src*="listen.libbyapp.com"]')
+                    next_chapter_btn = player_frame.locator('button[aria-label*="Next Chapter"]')
+                    next_chapter_btn.first.click(timeout=2000)
+                    print("Found forward button in player iframe (Next Chapter)")
+                    button_found = True
+                    time.sleep(5)
+                except (PlaywrightTimeoutError, Exception):
+                    pass
+
+                # Fallback: check other iframes with FORWARD_SELECTORS
+                if not button_found:
+                    try:
+                        iframes = page.locator('iframe').all()
+                        for iframe_locator in iframes:
+                            try:
+                                iframe_frame = iframe_locator.content_frame()
+                                if iframe_frame:
+                                    for selector in FORWARD_SELECTORS:
+                                        try:
+                                            iframe_frame.wait_for_selector(selector, timeout=2000)
+                                            print(f"Found forward button in iframe with selector: {selector}")
+                                            iframe_frame.click(selector)
+                                            button_found = True
+                                            time.sleep(5)
+                                            break
+                                        except PlaywrightTimeoutError:
+                                            continue
+                                        except Exception as e:
+                                            print(f"Error with iframe selector {selector}: {e}")
+                                            continue
+                                    if button_found:
+                                        break
+                            except Exception as e:
+                                print(f"Error accessing iframe: {e}")
+                                continue
                     except Exception as e:
-                        print(f"Error with selector {selector}: {e}")
-                        continue # Try next selector
+                        print(f"Error checking for iframes: {e}")
+
+                # If not found in iframe, try main page
+                if not button_found:
+                    for selector in FORWARD_SELECTORS:
+                        try:
+                            page.wait_for_selector(selector, timeout=2000)
+                            print(f"Found forward button with selector: {selector}")
+                            page.click(selector)
+                            button_found = True
+
+                            if button_found:
+                                time.sleep(5) # Reduced sleep time here
+                                break
+                        except PlaywrightTimeoutError:
+                            continue # Try next selector
+                        except Exception as e:
+                            print(f"Error with selector {selector}: {e}")
+                            continue # Try next selector
+                
+                # Last resort: try JavaScript click (works even if button is in iframe)
+                if not button_found:
+                    try:
+                        result = page.evaluate("""
+                            () => {
+                                const btn = document.querySelector('button.mini-player-jump-ahead');
+                                if (btn) {
+                                    btn.click();
+                                    return {success: true, found: true};
+                                }
+                                // Also check in iframes
+                                const iframes = document.querySelectorAll('iframe');
+                                for (let iframe of iframes) {
+                                    try {
+                                        const iframeDoc = iframe.contentDocument || iframe.contentWindow.document;
+                                        const iframeBtn = iframeDoc.querySelector('button.mini-player-jump-ahead');
+                                        if (iframeBtn) {
+                                            iframeBtn.click();
+                                            return {success: true, found: true, inIframe: true};
+                                        }
+                                    } catch (e) {
+                                        // Cross-origin iframe, can't access
+                                    }
+                                }
+                                return {success: false, found: false};
+                            }
+                        """)
+                        if result.get('success'):
+                            print(f"Successfully clicked forward button via JavaScript (in iframe: {result.get('inIframe', False)})")
+                            button_found = True
+                            time.sleep(5)
+                    except Exception as e:
+                        print(f"JavaScript click attempt failed: {e}")
 
                 if not button_found:
                     print("No forward button found with any selector. Debugging...")
@@ -596,20 +672,149 @@ def run():
                     page.screenshot(path=debug_screenshot)
                     print(f"Debug screenshot saved: {debug_screenshot}")
 
-                    # Print all buttons on page for debugging
+                    # Print all visible buttons on current page for debugging
                     try:
-                        all_buttons = page.locator('button').all()
-                        print(f"Found {len(all_buttons)} buttons on page:")
+                        # Wait a moment for DOM to stabilize
+                        time.sleep(2)
+                        all_buttons = page.locator('button:visible').all()
+                        print(f"Found {len(all_buttons)} visible buttons on current page:")
                         for idx, button in enumerate(all_buttons):  
                             try:
                                 text = button.text_content()[:50] if button.text_content() else "No text"
                                 classes = button.get_attribute('class') or "No classes"
                                 aria_label = button.get_attribute('aria-label') or "No aria-label"
-                                print(f"  Button {idx}: text='{text}' class='{classes}' aria-label='{aria_label}'")
-                            except:
-                                print(f"  Button {idx}: Could not read properties")
+                                # Check if button is actually in viewport
+                                is_visible = button.is_visible()
+                                bounding_box = button.bounding_box()
+                                print(f"  Button {idx}: text='{text}' class='{classes}' aria-label='{aria_label}' visible={is_visible} bbox={bounding_box}")
+                            except Exception as e:
+                                print(f"  Button {idx}: Could not read properties - {e}")
+                        
+                        # Also check for buttons with the specific selectors we're looking for
+                        print("\n=== DETAILED ANALYSIS OF FORWARD BUTTONS ===")
+                        for selector in FORWARD_SELECTORS:
+                            try:
+                                matching_buttons = page.locator(selector).all()
+                                print(f"\nSelector '{selector}': {len(matching_buttons)} total buttons found")
+                                
+                                for idx, btn in enumerate(matching_buttons):
+                                    try:
+                                        # Get basic info
+                                        text = btn.text_content()[:50] if btn.text_content() else "No text"
+                                        classes = btn.get_attribute('class') or "No classes"
+                                        aria_label = btn.get_attribute('aria-label') or "No aria-label"
+                                        
+                                        # Check visibility details
+                                        is_visible = btn.is_visible()
+                                        bounding_box = btn.bounding_box()
+                                        
+                                        # Get computed styles to understand why it might not be visible
+                                        computed_styles = page.evaluate("""
+                                            ([selector, index]) => {
+                                                const buttons = document.querySelectorAll(selector);
+                                                if (buttons[index]) {
+                                                    const btn = buttons[index];
+                                                    const styles = window.getComputedStyle(btn);
+                                                    return {
+                                                        display: styles.display,
+                                                        visibility: styles.visibility,
+                                                        opacity: styles.opacity,
+                                                        pointerEvents: styles.pointerEvents,
+                                                        zIndex: styles.zIndex,
+                                                        position: styles.position,
+                                                        width: styles.width,
+                                                        height: styles.height,
+                                                        offsetParent: btn.offsetParent !== null,
+                                                        clientWidth: btn.clientWidth,
+                                                        clientHeight: btn.clientHeight,
+                                                        offsetWidth: btn.offsetWidth,
+                                                        offsetHeight: btn.offsetHeight
+                                                    };
+                                                }
+                                                return null;
+                                            }
+                                        """, [selector, idx])
+                                        
+                                        print(f"  Button {idx}:")
+                                        print(f"    text='{text}'")
+                                        print(f"    class='{classes}'")
+                                        print(f"    aria-label='{aria_label}'")
+                                        print(f"    is_visible()={is_visible}")
+                                        print(f"    bounding_box={bounding_box}")
+                                        if computed_styles:
+                                            print(f"    CSS display={computed_styles['display']}")
+                                            print(f"    CSS visibility={computed_styles['visibility']}")
+                                            print(f"    CSS opacity={computed_styles['opacity']}")
+                                            print(f"    offsetParent exists={computed_styles['offsetParent']}")
+                                            print(f"    dimensions: {computed_styles['width']} x {computed_styles['height']}")
+                                            print(f"    actual size: {computed_styles['clientWidth']} x {computed_styles['clientHeight']}")
+                                        
+                                        # Check if it's in an iframe
+                                        try:
+                                            frame = btn.content_frame()
+                                            if frame:
+                                                print(f"    ⚠️  BUTTON IS IN AN IFRAME!")
+                                        except:
+                                            pass
+                                        
+                                    except Exception as e:
+                                        print(f"  Button {idx}: Error getting details - {e}")
+                                        
+                            except Exception as e:
+                                print(f"  Selector '{selector}': Error - {e}")
+                        
+                        # Check for iframes on the page
+                        print("\n=== CHECKING FOR IFRAMES ===")
+                        try:
+                            iframes = page.locator('iframe').all()
+                            print(f"Found {len(iframes)} iframes on the page")
+                            for idx, iframe_locator in enumerate(iframes):
+                                try:
+                                    src = iframe_locator.get_attribute('src') or "No src"
+                                    print(f"  Iframe {idx}: src='{src[:100]}'")
+                                    # Try to find buttons inside iframe
+                                    try:
+                                        iframe_frame = iframe_locator.content_frame()
+                                        if iframe_frame:
+                                            print(f"    Successfully accessed iframe frame object!")
+                                            iframe_buttons = iframe_frame.locator('button.mini-player-jump-ahead').all()
+                                            print(f"    Found {len(iframe_buttons)} skip buttons inside this iframe!")
+                                            # Also check all forward selectors in iframe
+                                            for sel in FORWARD_SELECTORS:
+                                                iframe_sel_buttons = iframe_frame.locator(sel).all()
+                                                if iframe_sel_buttons:
+                                                    visible_in_iframe = [b for b in iframe_sel_buttons if b.is_visible()]
+                                                    print(f"    Found {len(iframe_sel_buttons)} buttons ({len(visible_in_iframe)} visible) with selector '{sel}' in iframe!")
+                                    except Exception as e:
+                                        print(f"    Error accessing iframe content: {e}")
+                                        import traceback
+                                        traceback.print_exc()
+                                except:
+                                    pass
+                        except Exception as e:
+                            print(f"Error checking iframes: {e}")
+                        
+                        # Try force-clicking the button via JavaScript (even if Playwright thinks it's not visible)
+                        print("\n=== ATTEMPTING FORCE CLICK VIA JAVASCRIPT ===")
+                        try:
+                            result = page.evaluate("""
+                                () => {
+                                    const btn = document.querySelector('button.mini-player-jump-ahead');
+                                    if (btn) {
+                                        // Try to click it
+                                        btn.click();
+                                        return {success: true, found: true};
+                                    }
+                                    return {success: false, found: false};
+                                }
+                            """)
+                            print(f"JavaScript click attempt: {result}")
+                        except Exception as e:
+                            print(f"Error with JavaScript click: {e}")
                     except Exception as e:
                         print(f"Error listing buttons: {e}")
+                        import traceback
+                        traceback.print_exc()
 
                     break # Exit loop if button is not found (likely end of book)
 
