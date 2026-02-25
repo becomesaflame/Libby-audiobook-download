@@ -880,76 +880,60 @@ def run():
                             'button[aria-label*="Previous chapter"]',
                             'button[aria-label*="previous chapter"]',
                             'button[aria-label*="revious"]',
-                            'button[aria-label*="Back"]',
-                            'button[aria-label*="back"]',
                             'button.chapter-bar-prev-button',
                         ]
+                        ADVANCE_WAIT_SEC = 1
 
-                        # Step 1: Jump back using "Previous Chapter" (much faster than 15s rewinds)
                         prev_chapter_clicks = 0
+                        total_advance_clicks = 0
                         max_prev_chapters = 5
+                        max_advances_per_round = 120
+
                         while expected_next_part not in found_parts and prev_chapter_clicks < max_prev_chapters:
+                            # Go back one chapter
                             clicked_prev = False
                             for sel in PREV_CHAPTER_SELECTORS:
                                 try:
-                                    prev_btn = player_frame.locator(sel)
-                                    prev_btn.first.click(timeout=3000)
+                                    player_frame.locator(sel).first.click(timeout=3000)
                                     clicked_prev = True
                                     prev_chapter_clicks += 1
-                                    print(f"  Previous Chapter {prev_chapter_clicks}/{max_prev_chapters} (selector: {sel})")
-                                    time.sleep(5)
+                                    print(f"  Previous Chapter {prev_chapter_clicks}/{max_prev_chapters}")
+                                    time.sleep(3)
                                     break
                                 except (PlaywrightTimeoutError, Exception):
                                     continue
+
                             if not clicked_prev:
-                                try:
-                                    all_btns = player_frame.locator('button').all()
-                                    print(f"  DEBUG: {len(all_btns)} buttons in player iframe:")
-                                    for idx, btn in enumerate(all_btns):
-                                        try:
-                                            label = btn.get_attribute('aria-label') or ''
-                                            cls = btn.get_attribute('class') or ''
-                                            print(f"    btn[{idx}] aria-label='{label}' class='{cls}'")
-                                        except Exception:
-                                            pass
-                                except Exception as e:
-                                    print(f"  DEBUG: Could not enumerate iframe buttons: {e}")
-                                print(f"  Could not find Previous Chapter button with any selector.")
+                                print(f"  Could not find Previous Chapter button.")
                                 break
 
-                        if expected_next_part in downloaded_parts:
-                            print(f"  Found part {expected_next_part} after {prev_chapter_clicks} Previous Chapter click(s).")
+                            if expected_next_part in found_parts:
+                                break
+
+                            # Advance 15s at a time through this chapter to find the part
+                            advances_this_round = 0
+                            while expected_next_part not in found_parts and advances_this_round < max_advances_per_round:
+                                try:
+                                    player_frame.locator('button[aria-label*="Advance 15 seconds"]').first.click(timeout=3000)
+                                    advances_this_round += 1
+                                    total_advance_clicks += 1
+                                    if advances_this_round % 20 == 0:
+                                        print(f"    Advance 15s: {advances_this_round}/{max_advances_per_round} (total: {total_advance_clicks})")
+                                    time.sleep(ADVANCE_WAIT_SEC)
+                                except (PlaywrightTimeoutError, Exception) as e:
+                                    print(f"    Advance click failed: {e}")
+                                    break
+
+                            if expected_next_part in found_parts:
+                                break
+
+                            print(f"  Part {expected_next_part} not found after {advances_this_round} advances in this chapter. Going back further...")
+
+                        if expected_next_part in found_parts:
+                            print(f"  Found part {expected_next_part} after {prev_chapter_clicks} prev-chapter + {total_advance_clicks} advances.")
+                            time.sleep(3)
                         else:
-                            # Step 2: If Previous Chapter worked, advance 15s to find exact part boundary.
-                            # If Previous Chapter failed, rewind 15s as fallback.
-                            if prev_chapter_clicks > 0:
-                                advance_clicks = 0
-                                while expected_next_part not in downloaded_parts and advance_clicks < MAX_REWIND_CLICKS:
-                                    try:
-                                        advance_btn = player_frame.locator('button[aria-label*="Advance 15 seconds"]')
-                                        advance_btn.first.click(timeout=3000)
-                                        advance_clicks += 1
-                                        print(f"  Advance 15s {advance_clicks}/{MAX_REWIND_CLICKS} (looking for part {expected_next_part})")
-                                        time.sleep(REWIND_WAIT_SEC)
-                                    except (PlaywrightTimeoutError, Exception) as e:
-                                        print(f"  Advance click failed: {e}")
-                                        break
-                                status = "found" if expected_next_part in downloaded_parts else "not found"
-                                print(f"  Part {expected_next_part} {status} after {prev_chapter_clicks} prev-chapter + {advance_clicks} advance clicks.")
-                            else:
-                                rewind_clicks = 0
-                                while expected_next_part not in downloaded_parts and rewind_clicks < MAX_REWIND_CLICKS:
-                                    try:
-                                        rewind_btn = player_frame.locator('button[aria-label*="Rewind 15 seconds"]')
-                                        rewind_btn.first.click(timeout=3000)
-                                        rewind_clicks += 1
-                                        print(f"  Rewind 15s {rewind_clicks}/{MAX_REWIND_CLICKS} (looking for part {expected_next_part})")
-                                        time.sleep(REWIND_WAIT_SEC)
-                                    except (PlaywrightTimeoutError, Exception) as e:
-                                        print(f"  Rewind click failed: {e}")
-                                        break
-                                status = "found" if expected_next_part in downloaded_parts else "not found"
-                                print(f"  Part {expected_next_part} {status} after {rewind_clicks} rewind clicks (prev-chapter unavailable).")
+                            print(f"  Part {expected_next_part} not found after {prev_chapter_clicks} prev-chapter + {total_advance_clicks} advances.")
 
                 if len(downloaded_parts) == current_parts_count:
                     no_new_parts_count += 1
