@@ -1,0 +1,4 @@
+libby_config.json
+Libby_Audiobook_Downloads/
+__pycache__/
+*.pyc
