@@ -20,6 +20,7 @@ max_part_number_found = 0
 active_downloads_lock = threading.Lock()
 active_downloads_count = 0
 _latest_libby_part_number_trigger = None # Global variable to store the last part number seen in a Libby URL
+_libby_url_template = None # Captured from first part trigger, used to construct URLs for missing parts
 
 # --- Configuration Management Functions ---
 def load_config():
@@ -78,7 +79,7 @@ def handle_request(request):
     Callback function to process intercepted network requests.
     Identifies and downloads audiobook MP3 parts directly using requests library.
     """
-    global downloaded_parts, found_parts, max_part_number_found, active_downloads_count, _latest_libby_part_number_trigger
+    global downloaded_parts, found_parts, max_part_number_found, active_downloads_count, _latest_libby_part_number_trigger, _libby_url_template
 
     # Case 1: Intercept initial Libby part request (contains PartXX.mp3)
     # This request triggers the playback and sets up the session for the CDN download.
@@ -86,9 +87,12 @@ def handle_request(request):
         part_match = re.search(r"Part(\d+).mp3", request.url, re.IGNORECASE)
         if part_match:
             part_number = int(part_match.group(1))
-            with active_downloads_lock:  # Protect access to global trigger and found_parts
+            with active_downloads_lock:
                 _latest_libby_part_number_trigger = part_number
-                found_parts.add(part_number)  # Record part as soon as triggered (before download completes)
+                found_parts.add(part_number)
+                if _libby_url_template is None:
+                    _libby_url_template = re.sub(r'Part\d+\.mp3\?cmpt=.*', '', request.url)
+                    print(f"Captured Libby URL template: {_libby_url_template}")
             print(f"Detected Libby part trigger: {request.url} -> Set _latest_libby_part_number_trigger to {part_number}")
             # Do NOT attempt to get response body here, as it's typically empty or a redirect trigger.
             # We are just capturing the part number for the subsequent CDN request.
@@ -867,73 +871,9 @@ def run():
 
                     break # Exit loop if button is not found (likely end of book)
 
-                # If we clicked Next Chapter, ensure we didn't skip a part (audio parts can be shorter than chapters)
-                if button_found:
-                    time.sleep(2)
-                    max_found = max(found_parts) if found_parts else 0
-                    if expected_next_part not in found_parts and max_found >= expected_next_part:
-                        print(f"Gap detected: expected part {expected_next_part} but have part(s) up to {max_found}. Going back to find part {expected_next_part}...")
-                        player_frame = page.frame_locator('iframe[src*="listen.libbyapp.com"]')
-
-                        PREV_CHAPTER_SELECTORS = [
-                            'button[aria-label*="Previous Chapter"]',
-                            'button[aria-label*="Previous chapter"]',
-                            'button[aria-label*="previous chapter"]',
-                            'button[aria-label*="revious"]',
-                            'button.chapter-bar-prev-button',
-                        ]
-                        ADVANCE_WAIT_SEC = 1
-
-                        prev_chapter_clicks = 0
-                        total_advance_clicks = 0
-                        max_prev_chapters = 5
-                        max_advances_per_round = 120
-
-                        while expected_next_part not in found_parts and prev_chapter_clicks < max_prev_chapters:
-                            # Go back one chapter
-                            clicked_prev = False
-                            for sel in PREV_CHAPTER_SELECTORS:
-                                try:
-                                    player_frame.locator(sel).first.click(timeout=3000)
-                                    clicked_prev = True
-                                    prev_chapter_clicks += 1
-                                    print(f"  Previous Chapter {prev_chapter_clicks}/{max_prev_chapters}")
-                                    time.sleep(3)
-                                    break
-                                except (PlaywrightTimeoutError, Exception):
-                                    continue
-
-                            if not clicked_prev:
-                                print(f"  Could not find Previous Chapter button.")
-                                break
-
-                            if expected_next_part in found_parts:
-                                break
-
-                            # Advance 15s at a time through this chapter to find the part
-                            advances_this_round = 0
-                            while expected_next_part not in found_parts and advances_this_round < max_advances_per_round:
-                                try:
-                                    player_frame.locator('button[aria-label*="Advance 15 seconds"]').first.click(timeout=3000)
-                                    advances_this_round += 1
-                                    total_advance_clicks += 1
-                                    if advances_this_round % 20 == 0:
-                                        print(f"    Advance 15s: {advances_this_round}/{max_advances_per_round} (total: {total_advance_clicks})")
-                                    time.sleep(ADVANCE_WAIT_SEC)
-                                except (PlaywrightTimeoutError, Exception) as e:
-                                    print(f"    Advance click failed: {e}")
-                                    break
-
-                            if expected_next_part in found_parts:
-                                break
-
-                            print(f"  Part {expected_next_part} not found after {advances_this_round} advances in this chapter. Going back further...")
-
-                        if expected_next_part in found_parts:
-                            print(f"  Found part {expected_next_part} after {prev_chapter_clicks} prev-chapter + {total_advance_clicks} advances.")
-                            time.sleep(3)
-                        else:
-                            print(f"  Part {expected_next_part} not found after {prev_chapter_clicks} prev-chapter + {total_advance_clicks} advances.")
+                # Note: chapters span multiple audio parts, so chapter navigation
+                # will skip parts that fall mid-chapter. These are handled in Step 4
+                # using direct spine navigation instead of the slow button-click approach.
 
                 if len(downloaded_parts) == current_parts_count:
                     no_new_parts_count += 1
@@ -958,7 +898,7 @@ def run():
                 print(f"Still {current_active} downloads active. Waiting...")
                 time.sleep(5) # Wait a bit before checking again
 
-            # --- Step 4: Handling Missing Parts (Backward Seeking) ---
+            # --- Step 4: Retrieve Missing Parts via Direct Spine Navigation ---
             print("Checking for any missing parts and attempting to retrieve them...")
             missing_parts = []
             for i in range(1, max_part_number_found + 1):
@@ -969,45 +909,112 @@ def run():
                 print("No missing parts detected. All parts downloaded successfully!")
             else:
                 print(f"Missing parts identified: {sorted(missing_parts)}")
-                PREV_CHAPTER_SELECTORS_STEP4 = [
-                    'button[aria-label*="Previous Chapter"]',
-                    'button[aria-label*="Previous chapter"]',
-                    'button[aria-label*="previous chapter"]',
-                    'button.chapter-bar-prev-button',
-                ]
-                player_frame = page.frame_locator('iframe[src*="listen.libbyapp.com"]')
+
+                player_frame_obj = None
+                for frame in page.frames:
+                    if 'listen.libbyapp.com' in frame.url:
+                        player_frame_obj = frame
+                        break
 
                 for missing_part in sorted(missing_parts):
-                    print(f"Attempting to retrieve missing Part {missing_part}...")
-                    retries = 3
-                    for attempt in range(retries):
+                    if missing_part in downloaded_parts:
+                        continue
+                    print(f"Attempting to retrieve missing Part {missing_part} (spine {missing_part - 1})...")
+
+                    navigated = False
+                    if player_frame_obj:
                         try:
-                            for _ in range(2):
-                                clicked = False
-                                for sel in PREV_CHAPTER_SELECTORS_STEP4:
-                                    try:
-                                        player_frame.locator(sel).first.click(timeout=3000)
-                                        clicked = True
-                                        time.sleep(1)
-                                        break
-                                    except (PlaywrightTimeoutError, Exception):
-                                        continue
-                                if not clicked:
-                                    print("Reached beginning of audiobook while seeking backwards.")
-                                    break
-
-                            print(f"Attempt {attempt + 1} to trigger Part {missing_part} download...")
-                            time.sleep(5) # Give ample time for network requests
-
-                            if missing_part in downloaded_parts:
-                                print(f"Successfully retrieved missing Part {missing_part}!")
-                                break # Move to the next missing part
-                            else:
-                                print(f"Part {missing_part} not found after attempt {attempt + 1}.")
+                            result = player_frame_obj.evaluate("""
+                                (spineIndex) => {
+                                    try {
+                                        // OverDrive reader: try common API patterns
+                                        if (typeof bif !== 'undefined' && bif.player) {
+                                            bif.player.openSpine(spineIndex);
+                                            return {success: true, method: 'bif.player.openSpine'};
+                                        }
+                                        // Try window.player
+                                        if (window.player && window.player.openSpine) {
+                                            window.player.openSpine(spineIndex);
+                                            return {success: true, method: 'window.player.openSpine'};
+                                        }
+                                        // Try _roState / redux store
+                                        if (window.__NEXT_DATA__ || window.__store__) {
+                                            return {success: false, method: 'store found but no navigate'};
+                                        }
+                                        // Enumerate global objects that might be the player
+                                        var playerKeys = [];
+                                        for (var key in window) {
+                                            try {
+                                                if (window[key] && typeof window[key] === 'object' &&
+                                                    (window[key].openSpine || window[key].goToSpine ||
+                                                     window[key].loadSpine || window[key].playSpine)) {
+                                                    playerKeys.push(key);
+                                                }
+                                            } catch(e) {}
+                                        }
+                                        if (playerKeys.length > 0) {
+                                            return {success: false, method: 'found objects: ' + playerKeys.join(',')};
+                                        }
+                                        return {success: false, method: 'no player API found'};
+                                    } catch(e) {
+                                        return {success: false, error: e.message};
+                                    }
+                                }
+                            """, missing_part - 1)
+                            print(f"  JS spine navigation result: {result}")
+                            if result.get('success'):
+                                navigated = True
+                                time.sleep(5)
                         except Exception as e:
-                            print(f"Error during backward seeking for Part {missing_part}: {e}")
+                            print(f"  JS spine navigation failed: {e}")
+
+                    if not navigated and _libby_url_template:
+                        import base64 as b64
+                        spine_json = json.dumps({"spine": missing_part - 1})
+                        cmpt_unsigned = b64.b64encode(spine_json.encode()).decode()
+                        part_url = f"{_libby_url_template}Part{missing_part:02d}.mp3?cmpt={cmpt_unsigned}"
+                        print(f"  Trying direct URL fetch for Part {missing_part}...")
+                        try:
+                            if player_frame_obj:
+                                player_frame_obj.evaluate(f"""
+                                    (url) => {{
+                                        var audio = new Audio();
+                                        audio.src = url;
+                                        audio.load();
+                                    }}
+                                """, part_url)
+                                time.sleep(5)
+                            page.evaluate(f"""
+                                (url) => fetch(url, {{mode: 'no-cors'}}).catch(() => {{}})
+                            """, part_url)
+                            time.sleep(5)
+                        except Exception as e:
+                            print(f"  Direct URL fetch failed: {e}")
+
                     if missing_part not in downloaded_parts:
-                        print(f"Failed to retrieve Part {missing_part} after {retries} attempts.")
+                        print(f"  Trying chapter navigation fallback for Part {missing_part}...")
+                        player_fl = page.frame_locator('iframe[src*="listen.libbyapp.com"]')
+                        PREV_SELS = ['button[aria-label*="Previous Chapter"]', 'button[aria-label*="Previous chapter"]']
+                        for attempt in range(3):
+                            try:
+                                for _ in range(2):
+                                    for sel in PREV_SELS:
+                                        try:
+                                            player_fl.locator(sel).first.click(timeout=3000)
+                                            time.sleep(1)
+                                            break
+                                        except (PlaywrightTimeoutError, Exception):
+                                            continue
+                                time.sleep(5)
+                                if missing_part in downloaded_parts:
+                                    break
+                            except Exception as e:
+                                print(f"  Chapter nav attempt {attempt+1} failed: {e}")
+
+                    if missing_part in downloaded_parts:
+                        print(f"  Successfully retrieved Part {missing_part}!")
+                    else:
+                        print(f"  Failed to retrieve Part {missing_part}.")
 
             print("All download attempts complete.")
 
