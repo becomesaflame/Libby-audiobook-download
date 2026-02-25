@@ -21,6 +21,7 @@ active_downloads_lock = threading.Lock()
 active_downloads_count = 0
 _latest_libby_part_number_trigger = None # Global variable to store the last part number seen in a Libby URL
 _libby_url_template = None # Captured from first part trigger, used to construct URLs for missing parts
+_signed_spine_urls = {} # spine_index -> full signed Libby URL, captured from openbook data
 
 # --- Configuration Management Functions ---
 def load_config():
@@ -93,6 +94,7 @@ def handle_request(request):
                 if _libby_url_template is None:
                     _libby_url_template = re.sub(r'Part\d+\.mp3\?cmpt=.*', '', request.url)
                     print(f"Captured Libby URL template: {_libby_url_template}")
+                _signed_spine_urls[part_number] = request.url
             print(f"Detected Libby part trigger: {request.url} -> Set _latest_libby_part_number_trigger to {part_number}")
             # Do NOT attempt to get response body here, as it's typically empty or a redirect trigger.
             # We are just capturing the part number for the subsequent CDN request.
@@ -898,7 +900,7 @@ def run():
                 print(f"Still {current_active} downloads active. Waiting...")
                 time.sleep(5) # Wait a bit before checking again
 
-            # --- Step 4: Retrieve Missing Parts via Direct Spine Navigation ---
+            # --- Step 4: Retrieve Missing Parts via Signed URL Extraction ---
             print("Checking for any missing parts and attempting to retrieve them...")
             missing_parts = []
             for i in range(1, max_part_number_found + 1):
@@ -916,83 +918,80 @@ def run():
                         player_frame_obj = frame
                         break
 
+                # Try to extract all signed spine URLs from the player's JavaScript
+                if player_frame_obj and len(_signed_spine_urls) < max_part_number_found:
+                    print("Extracting signed spine URLs from player...")
+                    try:
+                        spine_data = player_frame_obj.evaluate(r"""
+                            () => {
+                                try {
+                                    var results = {};
+                                    var scripts = document.querySelectorAll('script');
+                                    for (var s of scripts) {
+                                        var text = s.textContent || '';
+                                        var matches = text.matchAll(/Part(\d+)\.mp3\?cmpt=([A-Za-z0-9+\/=%]+--[a-f0-9]+)/g);
+                                        for (var m of matches) {
+                                            results[parseInt(m[1])] = m[2];
+                                        }
+                                    }
+                                    function searchObj(obj, depth) {
+                                        if (depth > 3 || !obj) return;
+                                        try {
+                                            if (typeof obj === 'string' && obj.includes('cmpt=') && obj.includes('Part')) {
+                                                var m = obj.match(/Part(\d+)\.mp3\?cmpt=([A-Za-z0-9+\/=%]+--[a-f0-9]+)/);
+                                                if (m) results[parseInt(m[1])] = m[2];
+                                            }
+                                            if (typeof obj === 'object') {
+                                                for (var k in obj) {
+                                                    try { searchObj(obj[k], depth + 1); } catch(e) {}
+                                                }
+                                            }
+                                        } catch(e) {}
+                                    }
+                                    try { searchObj(window.__NEXT_DATA__, 0); } catch(e) {}
+                                    try { searchObj(window.__STATE__, 0); } catch(e) {}
+                                    try { searchObj(window.roster, 0); } catch(e) {}
+                                    return {found: Object.keys(results).length, urls: results};
+                                } catch(e) {
+                                    return {error: e.message, found: 0, urls: {}};
+                                }
+                            }
+                        """)
+                        print(f"  Spine URL extraction: found {spine_data.get('found', 0)} signed URLs")
+                        if spine_data.get('urls'):
+                            for part_str, cmpt in spine_data['urls'].items():
+                                part_num = int(part_str)
+                                if part_num not in _signed_spine_urls and _libby_url_template:
+                                    full_url = f"{_libby_url_template}Part{part_num:02d}.mp3?cmpt={cmpt}"
+                                    _signed_spine_urls[part_num] = full_url
+                    except Exception as e:
+                        print(f"  Spine URL extraction failed: {e}")
+
                 for missing_part in sorted(missing_parts):
                     if missing_part in downloaded_parts:
                         continue
                     print(f"Attempting to retrieve missing Part {missing_part} (spine {missing_part - 1})...")
 
-                    navigated = False
-                    if player_frame_obj:
-                        try:
-                            result = player_frame_obj.evaluate("""
-                                (spineIndex) => {
-                                    try {
-                                        // OverDrive reader: try common API patterns
-                                        if (typeof bif !== 'undefined' && bif.player) {
-                                            bif.player.openSpine(spineIndex);
-                                            return {success: true, method: 'bif.player.openSpine'};
-                                        }
-                                        // Try window.player
-                                        if (window.player && window.player.openSpine) {
-                                            window.player.openSpine(spineIndex);
-                                            return {success: true, method: 'window.player.openSpine'};
-                                        }
-                                        // Try _roState / redux store
-                                        if (window.__NEXT_DATA__ || window.__store__) {
-                                            return {success: false, method: 'store found but no navigate'};
-                                        }
-                                        // Enumerate global objects that might be the player
-                                        var playerKeys = [];
-                                        for (var key in window) {
-                                            try {
-                                                if (window[key] && typeof window[key] === 'object' &&
-                                                    (window[key].openSpine || window[key].goToSpine ||
-                                                     window[key].loadSpine || window[key].playSpine)) {
-                                                    playerKeys.push(key);
-                                                }
-                                            } catch(e) {}
-                                        }
-                                        if (playerKeys.length > 0) {
-                                            return {success: false, method: 'found objects: ' + playerKeys.join(',')};
-                                        }
-                                        return {success: false, method: 'no player API found'};
-                                    } catch(e) {
-                                        return {success: false, error: e.message};
-                                    }
-                                }
-                            """, missing_part - 1)
-                            print(f"  JS spine navigation result: {result}")
-                            if result.get('success'):
-                                navigated = True
-                                time.sleep(5)
-                        except Exception as e:
-                            print(f"  JS spine navigation failed: {e}")
-
-                    if not navigated and _libby_url_template:
-                        import base64 as b64
-                        spine_json = json.dumps({"spine": missing_part - 1})
-                        cmpt_unsigned = b64.b64encode(spine_json.encode()).decode()
-                        part_url = f"{_libby_url_template}Part{missing_part:02d}.mp3?cmpt={cmpt_unsigned}"
-                        print(f"  Trying direct URL fetch for Part {missing_part}...")
+                    # Method 1: Use stored signed URL if available
+                    if missing_part in _signed_spine_urls and missing_part not in downloaded_parts:
+                        signed_url = _signed_spine_urls[missing_part]
+                        print(f"  Using signed URL for Part {missing_part}...")
                         try:
                             if player_frame_obj:
-                                player_frame_obj.evaluate(f"""
-                                    (url) => {{
+                                player_frame_obj.evaluate("""
+                                    (url) => {
                                         var audio = new Audio();
                                         audio.src = url;
                                         audio.load();
-                                    }}
-                                """, part_url)
-                                time.sleep(5)
-                            page.evaluate(f"""
-                                (url) => fetch(url, {{mode: 'no-cors'}}).catch(() => {{}})
-                            """, part_url)
-                            time.sleep(5)
+                                    }
+                                """, signed_url)
+                                time.sleep(8)
                         except Exception as e:
-                            print(f"  Direct URL fetch failed: {e}")
+                            print(f"  Signed URL fetch failed: {e}")
 
+                    # Method 2: Chapter navigation fallback
                     if missing_part not in downloaded_parts:
-                        print(f"  Trying chapter navigation fallback for Part {missing_part}...")
+                        print(f"  Trying chapter navigation for Part {missing_part}...")
                         player_fl = page.frame_locator('iframe[src*="listen.libbyapp.com"]')
                         PREV_SELS = ['button[aria-label*="Previous Chapter"]', 'button[aria-label*="Previous chapter"]']
                         for attempt in range(3):
