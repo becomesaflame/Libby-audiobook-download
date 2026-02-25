@@ -46,7 +46,7 @@ def load_config():
             elif field == 'LIBBY_PASSWORD':
                 config[field] = input(f"Please enter your {field.replace('_', ' ')} (PIN): ")
             elif field == 'LIBRARY':
-                config[field] = input(f"Please enter your {field.replace('_', ' ')} (e.g., Boston Public Library): ")
+                config[field] = input(f"Please enter your {field.replace('_', ' ')} (e.g., [REDACTED]): ")
             elif field == 'DOWNLOAD_DIRECTORY':
                 default_dir = os.path.join(os.getcwd(), "Libby_Audiobook_Downloads")
                 config[field] = input(f"Enter download directory (default: {default_dir}): ") or default_dir
@@ -64,6 +64,13 @@ def save_config(config_data):
     with open(CONFIG_FILE, 'w') as f:
         json.dump(config_data, f, indent=4)
     print(f"Saved configuration to {CONFIG_FILE}.")
+
+def sanitize_filename(name):
+    """Remove or replace characters that are invalid in directory/file names."""
+    sanitized = re.sub(r'[<>:"/\\|?*]', '_', name)
+    sanitized = sanitized.strip().strip('.')
+    sanitized = re.sub(r'[_\s]+', ' ', sanitized)
+    return sanitized.strip()
 
 # --- Network Request Handler ---
 def handle_request(request):
@@ -186,7 +193,7 @@ def run():
     config = load_config()
 
     # Playwright Browser Settings - now uses HEADLESS_MODE from config
-    HEADLESS_MODE = False # Keep this as False for debugging, can be moved to config later if desired
+    HEADLESS_MODE = True # Keep this as False for debugging, can be moved to config later if desired
 
     # Initialize Playwright with the stealth plugin
     with Stealth().use_sync(sync_playwright()) as p:
@@ -495,14 +502,28 @@ def run():
 
                 audiobook_tiles = page.locator('.title-list-tiles .title-tile').all()
                 audiobook_titles = []
+                audiobook_authors = []
                 for i, tile in enumerate(audiobook_tiles):
-                    # Extract the title text from within the tile
                     title_element = tile.locator('.title-tile-title').first
                     if title_element:
                         title_text = title_element.text_content().strip().replace('&nbsp;', ' ')
                         audiobook_titles.append(title_text)
 
+                    author_text = ""
+                    for author_selector in ['.title-tile-author', '.title-tile-creator', '.title-tile-subtitle']:
+                        try:
+                            author_element = tile.locator(author_selector).first
+                            if author_element and author_element.is_visible():
+                                candidate = author_element.text_content().strip().replace('&nbsp;', ' ')
+                                if candidate:
+                                    author_text = candidate
+                                    break
+                        except Exception:
+                            continue
+                    audiobook_authors.append(author_text)
+
                 print(f"DEBUG: Parsed Audiobook Titles: {audiobook_titles}")
+                print(f"DEBUG: Parsed Audiobook Authors: {audiobook_authors}")
 
                 if not audiobook_titles:
                     print("No audiobooks found on your shelf.")
@@ -532,6 +553,21 @@ def run():
                                 print("Invalid choice. Please enter a number from the list.")
                         except ValueError:
                             print("Invalid input. Please enter a number.")
+
+                # Create a book-specific download subdirectory (Author/Title or just Title)
+                selected_author = audiobook_authors[choice_index] if choice_index < len(audiobook_authors) else ""
+                book_folder_name = sanitize_filename(selected_title)
+                if selected_author:
+                    author_folder_name = sanitize_filename(selected_author)
+                    book_download_dir = os.path.join(config['DOWNLOAD_DIRECTORY'], author_folder_name, book_folder_name)
+                    print(f"Author: '{selected_author}' -> folder: '{author_folder_name}'")
+                else:
+                    book_download_dir = os.path.join(config['DOWNLOAD_DIRECTORY'], book_folder_name)
+                    print("No author info found on shelf tile; using title-only folder.")
+
+                os.makedirs(book_download_dir, exist_ok=True)
+                print(f"Download directory for this book: {book_download_dir}")
+                config['DOWNLOAD_DIRECTORY'] = book_download_dir
 
                 # Locate the specific audiobook tile using the selected title
                 audiobook_tile_locator = page.locator(f"""div.title-tile:has-text("{selected_title}")""").first
@@ -833,28 +869,72 @@ def run():
 
                 # If we clicked Next Chapter, ensure we didn't skip a part (audio parts can be shorter than chapters)
                 if button_found:
-                    # Short wait for Libby trigger to be seen (found_parts updates immediately in request handler)
                     time.sleep(2)
                     max_found = max(found_parts) if found_parts else 0
                     if expected_next_part not in found_parts and max_found >= expected_next_part:
-                        print(f"Gap detected: expected part {expected_next_part} but have part(s) up to {max_found}. Rewinding to find part {expected_next_part}...")
-                        rewind_clicks = 0
-                        breakpoint()
-                        while expected_next_part not in downloaded_parts: # and rewind_clicks < MAX_REWIND_CLICKS:
-                            try:
-                                player_frame = page.frame_locator('iframe[src*="listen.libbyapp.com"]')
-                                rewind_btn = player_frame.locator('button[aria-label*="Rewind 15 seconds"]')
-                                rewind_btn.first.click(timeout=2000)
-                                rewind_clicks += 1
-                                print(f"  Rewind {rewind_clicks}/{MAX_REWIND_CLICKS} (Rewind 15 seconds)")
-                                time.sleep(REWIND_WAIT_SEC)
-                            except (PlaywrightTimeoutError, Exception) as e:
-                                print(f"  Rewind click failed: {e}")
+                        print(f"Gap detected: expected part {expected_next_part} but have part(s) up to {max_found}. Going back to find part {expected_next_part}...")
+                        player_frame = page.frame_locator('iframe[src*="listen.libbyapp.com"]')
+
+                        PREV_CHAPTER_SELECTORS = [
+                            'button[aria-label*="Previous Chapter"]',
+                            'button[aria-label*="Previous chapter"]',
+                            'button[aria-label*="previous chapter"]',
+                            'button.chapter-bar-prev-button',
+                        ]
+
+                        # Step 1: Jump back using "Previous Chapter" (much faster than 15s rewinds)
+                        prev_chapter_clicks = 0
+                        max_prev_chapters = 5
+                        while expected_next_part not in found_parts and prev_chapter_clicks < max_prev_chapters:
+                            clicked_prev = False
+                            for sel in PREV_CHAPTER_SELECTORS:
+                                try:
+                                    prev_btn = player_frame.locator(sel)
+                                    prev_btn.first.click(timeout=3000)
+                                    clicked_prev = True
+                                    prev_chapter_clicks += 1
+                                    print(f"  Previous Chapter {prev_chapter_clicks}/{max_prev_chapters} (selector: {sel})")
+                                    time.sleep(5)
+                                    break
+                                except (PlaywrightTimeoutError, Exception):
+                                    continue
+                            if not clicked_prev:
+                                print(f"  Could not find Previous Chapter button with any selector.")
                                 break
+
                         if expected_next_part in downloaded_parts:
-                            print(f"  Found part {expected_next_part} after {rewind_clicks} rewind(s).")
+                            print(f"  Found part {expected_next_part} after {prev_chapter_clicks} Previous Chapter click(s).")
                         else:
-                            print(f"  Part {expected_next_part} not found after {MAX_REWIND_CLICKS} rewind clicks.")
+                            # Step 2: If Previous Chapter worked, advance 15s to find exact part boundary.
+                            # If Previous Chapter failed, rewind 15s as fallback.
+                            if prev_chapter_clicks > 0:
+                                advance_clicks = 0
+                                while expected_next_part not in downloaded_parts and advance_clicks < MAX_REWIND_CLICKS:
+                                    try:
+                                        advance_btn = player_frame.locator('button[aria-label*="Advance 15 seconds"]')
+                                        advance_btn.first.click(timeout=3000)
+                                        advance_clicks += 1
+                                        print(f"  Advance 15s {advance_clicks}/{MAX_REWIND_CLICKS} (looking for part {expected_next_part})")
+                                        time.sleep(REWIND_WAIT_SEC)
+                                    except (PlaywrightTimeoutError, Exception) as e:
+                                        print(f"  Advance click failed: {e}")
+                                        break
+                                status = "found" if expected_next_part in downloaded_parts else "not found"
+                                print(f"  Part {expected_next_part} {status} after {prev_chapter_clicks} prev-chapter + {advance_clicks} advance clicks.")
+                            else:
+                                rewind_clicks = 0
+                                while expected_next_part not in downloaded_parts and rewind_clicks < MAX_REWIND_CLICKS:
+                                    try:
+                                        rewind_btn = player_frame.locator('button[aria-label*="Rewind 15 seconds"]')
+                                        rewind_btn.first.click(timeout=3000)
+                                        rewind_clicks += 1
+                                        print(f"  Rewind 15s {rewind_clicks}/{MAX_REWIND_CLICKS} (looking for part {expected_next_part})")
+                                        time.sleep(REWIND_WAIT_SEC)
+                                    except (PlaywrightTimeoutError, Exception) as e:
+                                        print(f"  Rewind click failed: {e}")
+                                        break
+                                status = "found" if expected_next_part in downloaded_parts else "not found"
+                                print(f"  Part {expected_next_part} {status} after {rewind_clicks} rewind clicks (prev-chapter unavailable).")
 
                 if len(downloaded_parts) == current_parts_count:
                     no_new_parts_count += 1
@@ -890,8 +970,12 @@ def run():
                 print("No missing parts detected. All parts downloaded successfully!")
             else:
                 print(f"Missing parts identified: {sorted(missing_parts)}")
-                PREV_CHAPTER_SELECTOR = """button[aria-label*="Previous chapter"]"""
-                # Use player iframe (same as forward pass) so backward seeking actually moves the player
+                PREV_CHAPTER_SELECTORS_STEP4 = [
+                    'button[aria-label*="Previous Chapter"]',
+                    'button[aria-label*="Previous chapter"]',
+                    'button[aria-label*="previous chapter"]',
+                    'button.chapter-bar-prev-button',
+                ]
                 player_frame = page.frame_locator('iframe[src*="listen.libbyapp.com"]')
 
                 for missing_part in sorted(missing_parts):
@@ -899,13 +983,19 @@ def run():
                     retries = 3
                     for attempt in range(retries):
                         try:
-                            for _ in range(2): # Click 'previous chapter' a couple of times
-                                try:
-                                    player_frame.locator(PREV_CHAPTER_SELECTOR).first.click(timeout=2000)
-                                    time.sleep(1)
-                                except PlaywrightTimeoutError:
+                            for _ in range(2):
+                                clicked = False
+                                for sel in PREV_CHAPTER_SELECTORS_STEP4:
+                                    try:
+                                        player_frame.locator(sel).first.click(timeout=3000)
+                                        clicked = True
+                                        time.sleep(1)
+                                        break
+                                    except (PlaywrightTimeoutError, Exception):
+                                        continue
+                                if not clicked:
                                     print("Reached beginning of audiobook while seeking backwards.")
-                                    break # Can't go back further
+                                    break
 
                             print(f"Attempt {attempt + 1} to trigger Part {missing_part} download...")
                             time.sleep(5) # Give ample time for network requests
