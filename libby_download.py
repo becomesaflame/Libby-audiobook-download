@@ -15,6 +15,7 @@ AUTO_SELECT_FIRST_AUDIOBOOK = True  # Set to False for manual selection
 
 # --- Global Variables for Tracking Download Progress ---
 downloaded_parts = set()
+found_parts = set()  # Parts detected as soon as Libby triggers (updates before download completes)
 max_part_number_found = 0
 active_downloads_lock = threading.Lock()
 active_downloads_count = 0
@@ -70,7 +71,7 @@ def handle_request(request):
     Callback function to process intercepted network requests.
     Identifies and downloads audiobook MP3 parts directly using requests library.
     """
-    global downloaded_parts, max_part_number_found, active_downloads_count, _latest_libby_part_number_trigger
+    global downloaded_parts, found_parts, max_part_number_found, active_downloads_count, _latest_libby_part_number_trigger
 
     # Case 1: Intercept initial Libby part request (contains PartXX.mp3)
     # This request triggers the playback and sets up the session for the CDN download.
@@ -78,11 +79,13 @@ def handle_request(request):
         part_match = re.search(r"Part(\d+).mp3", request.url, re.IGNORECASE)
         if part_match:
             part_number = int(part_match.group(1))
-            with active_downloads_lock: # Protect access to global trigger variable
+            with active_downloads_lock:  # Protect access to global trigger and found_parts
                 _latest_libby_part_number_trigger = part_number
+                found_parts.add(part_number)  # Record part as soon as triggered (before download completes)
             print(f"Detected Libby part trigger: {request.url} -> Set _latest_libby_part_number_trigger to {part_number}")
             # Do NOT attempt to get response body here, as it's typically empty or a redirect trigger.
             # We are just capturing the part number for the subsequent CDN request.
+            breakpoint()
             return # Exit early, this request is just a trigger
 
     # Case 2: Intercept actual CDN audio request (does NOT contain PartXX.mp3, relies on previous trigger)
@@ -134,18 +137,23 @@ def handle_request(request):
             print(f"  Requests.get() Response Status: {download_response.status_code}")
             print(f"  Requests.get() Response Headers: {download_response.headers}")
 
-            if download_response.status_code == 200 and content_length > 0:
-                with open(file_path, "wb") as f:
-                    f.write(download_response.content)
+            # Accept 200 OK or 206 Partial Content (range request) when we have body content
+            if (download_response.status_code in (200, 206)) and content_length > 0:
+                # Don't overwrite an existing full file with a smaller 206 partial (concurrent requests)
+                if os.path.exists(file_path) and content_length < os.path.getsize(file_path):
+                    print(f"Skipping {file_name}: already have larger file ({os.path.getsize(file_path)} bytes), this response is {content_length} bytes")
+                else:
+                    with open(file_path, "wb") as f:
+                        f.write(download_response.content)
 
-                print(f"Successfully downloaded {file_name} ({content_length} bytes)")
-                downloaded_parts.add(part_number)
-                max_part_number_found = max(max_part_number_found, part_number)
-                
-                # Reset the trigger AFTER successfully downloading the corresponding CDN part
-                with active_downloads_lock:
-                    _latest_libby_part_number_trigger = None 
-                    print(f"  Reset _latest_libby_part_number_trigger to None after Part {part_number} download.")
+                    print(f"Successfully downloaded {file_name} ({content_length} bytes)")
+                    downloaded_parts.add(part_number)
+                    max_part_number_found = max(max_part_number_found, part_number)
+                    
+                    # Reset the trigger AFTER successfully downloading the corresponding CDN part
+                    with active_downloads_lock:
+                        _latest_libby_part_number_trigger = None 
+                        print(f"  Reset _latest_libby_part_number_trigger to None after Part {part_number} download.")
             else:
                 print(f"Failed to download {file_name}. Status: {download_response.status_code}, Body Size: {content_length} bytes.")
                 if download_response.status_code == 403:
@@ -565,9 +573,13 @@ def run():
                 'button.mini-player-jump-ahead',
             ]
 
+            MAX_REWIND_CLICKS = 40  # ~10 minutes of rewind (15s per click) to find a missed part
+            REWIND_WAIT_SEC = 3    # Wait after each rewind click for part to load
+
             for i in range(MAX_FORWARD_CLICKS):
                 current_parts_count = len(downloaded_parts)
-                print(f"Forward pass iteration {i+1}. Current parts downloaded: {current_parts_count}")
+                expected_next_part = max_part_number_found + 1  # Consecutive part we expect next
+                print(f"Forward pass iteration {i+1}. Current parts downloaded: {current_parts_count} (expect next part {expected_next_part})")
 
                 # Try to find the "Next Chapter" button (advances to next part; label e.g. "Next Chapter . 12 minutes ahead.")
                 # The Libby player runs in an iframe (listen.libbyapp.com); the button is inside it at index 12.
@@ -590,13 +602,14 @@ def run():
                         iframes = page.locator('iframe').all()
                         for iframe_locator in iframes:
                             try:
-                                iframe_frame = iframe_locator.content_frame()
+                                # content_frame is a property (not a method); use .locator().first, not Frame API
+                                iframe_frame = iframe_locator.content_frame
                                 if iframe_frame:
                                     for selector in FORWARD_SELECTORS:
                                         try:
-                                            iframe_frame.wait_for_selector(selector, timeout=2000)
+                                            iframe_frame.locator(selector).first.wait_for(state='visible', timeout=2000)
                                             print(f"Found forward button in iframe with selector: {selector}")
-                                            iframe_frame.click(selector)
+                                            iframe_frame.locator(selector).first.click()
                                             button_found = True
                                             time.sleep(5)
                                             break
@@ -751,7 +764,7 @@ def run():
                                         
                                         # Check if it's in an iframe
                                         try:
-                                            frame = btn.content_frame()
+                                            frame = btn.content_frame
                                             if frame:
                                                 print(f"    ⚠️  BUTTON IS IN AN IFRAME!")
                                         except:
@@ -774,7 +787,7 @@ def run():
                                     print(f"  Iframe {idx}: src='{src[:100]}'")
                                     # Try to find buttons inside iframe
                                     try:
-                                        iframe_frame = iframe_locator.content_frame()
+                                        iframe_frame = iframe_locator.content_frame
                                         if iframe_frame:
                                             print(f"    Successfully accessed iframe frame object!")
                                             iframe_buttons = iframe_frame.locator('button.mini-player-jump-ahead').all()
@@ -818,6 +831,31 @@ def run():
 
                     break # Exit loop if button is not found (likely end of book)
 
+                # If we clicked Next Chapter, ensure we didn't skip a part (audio parts can be shorter than chapters)
+                if button_found:
+                    # Short wait for Libby trigger to be seen (found_parts updates immediately in request handler)
+                    time.sleep(2)
+                    max_found = max(found_parts) if found_parts else 0
+                    if expected_next_part not in found_parts and max_found >= expected_next_part:
+                        print(f"Gap detected: expected part {expected_next_part} but have part(s) up to {max_found}. Rewinding to find part {expected_next_part}...")
+                        rewind_clicks = 0
+                        breakpoint()
+                        while expected_next_part not in downloaded_parts: # and rewind_clicks < MAX_REWIND_CLICKS:
+                            try:
+                                player_frame = page.frame_locator('iframe[src*="listen.libbyapp.com"]')
+                                rewind_btn = player_frame.locator('button[aria-label*="Rewind 15 seconds"]')
+                                rewind_btn.first.click(timeout=2000)
+                                rewind_clicks += 1
+                                print(f"  Rewind {rewind_clicks}/{MAX_REWIND_CLICKS} (Rewind 15 seconds)")
+                                time.sleep(REWIND_WAIT_SEC)
+                            except (PlaywrightTimeoutError, Exception) as e:
+                                print(f"  Rewind click failed: {e}")
+                                break
+                        if expected_next_part in downloaded_parts:
+                            print(f"  Found part {expected_next_part} after {rewind_clicks} rewind(s).")
+                        else:
+                            print(f"  Part {expected_next_part} not found after {MAX_REWIND_CLICKS} rewind clicks.")
+
                 if len(downloaded_parts) == current_parts_count:
                     no_new_parts_count += 1
                     print(f"No new parts detected in this iteration ({no_new_parts_count}/{MAX_NO_NEW_PARTS_ITERATIONS}).")
@@ -853,6 +891,8 @@ def run():
             else:
                 print(f"Missing parts identified: {sorted(missing_parts)}")
                 PREV_CHAPTER_SELECTOR = """button[aria-label*="Previous chapter"]"""
+                # Use player iframe (same as forward pass) so backward seeking actually moves the player
+                player_frame = page.frame_locator('iframe[src*="listen.libbyapp.com"]')
 
                 for missing_part in sorted(missing_parts):
                     print(f"Attempting to retrieve missing Part {missing_part}...")
@@ -861,7 +901,7 @@ def run():
                         try:
                             for _ in range(2): # Click 'previous chapter' a couple of times
                                 try:
-                                    page.click(PREV_CHAPTER_SELECTOR, timeout=2000)
+                                    player_frame.locator(PREV_CHAPTER_SELECTOR).first.click(timeout=2000)
                                     time.sleep(1)
                                 except PlaywrightTimeoutError:
                                     print("Reached beginning of audiobook while seeking backwards.")
