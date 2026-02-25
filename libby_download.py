@@ -193,7 +193,7 @@ def run():
     config = load_config()
 
     # Playwright Browser Settings - now uses HEADLESS_MODE from config
-    HEADLESS_MODE = True # Keep this as False for debugging, can be moved to config later if desired
+    HEADLESS_MODE = False # Keep this as False for debugging, can be moved to config later if desired
 
     # Initialize Playwright with the stealth plugin
     with Stealth().use_sync(sync_playwright()) as p:
@@ -879,6 +879,9 @@ def run():
                             'button[aria-label*="Previous Chapter"]',
                             'button[aria-label*="Previous chapter"]',
                             'button[aria-label*="previous chapter"]',
+                            'button[aria-label*="revious"]',
+                            'button[aria-label*="Back"]',
+                            'button[aria-label*="back"]',
                             'button.chapter-bar-prev-button',
                         ]
 
@@ -899,6 +902,18 @@ def run():
                                 except (PlaywrightTimeoutError, Exception):
                                     continue
                             if not clicked_prev:
+                                try:
+                                    all_btns = player_frame.locator('button').all()
+                                    print(f"  DEBUG: {len(all_btns)} buttons in player iframe:")
+                                    for idx, btn in enumerate(all_btns):
+                                        try:
+                                            label = btn.get_attribute('aria-label') or ''
+                                            cls = btn.get_attribute('class') or ''
+                                            print(f"    btn[{idx}] aria-label='{label}' class='{cls}'")
+                                        except Exception:
+                                            pass
+                                except Exception as e:
+                                    print(f"  DEBUG: Could not enumerate iframe buttons: {e}")
                                 print(f"  Could not find Previous Chapter button with any selector.")
                                 break
 
