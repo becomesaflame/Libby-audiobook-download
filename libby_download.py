@@ -593,11 +593,25 @@ def run():
                 print(f"An error occurred while listing/selecting audiobooks: {e}")
                 return
 
-            print("Audiobook player opened. Starting part discovery...")
-            time.sleep(5) # Give player time to load initial parts and for network requests to fire
+            print("Audiobook player opened. Rewinding to beginning...")
+            time.sleep(5)
             screenshot_path = os.path.join(config['DOWNLOAD_DIRECTORY'], "16_after_audiobook_detail_load.png")
             page.screenshot(path=screenshot_path)
 
+            # Navigate to the beginning of the book so the forward pass starts from Part 1
+            try:
+                player_frame_init = page.frame_locator('iframe[src*="listen.libbyapp.com"]')
+                for rewind_i in range(50):
+                    try:
+                        prev_btn = player_frame_init.locator('button[aria-label*="Previous Chapter"]')
+                        prev_btn.first.click(timeout=2000)
+                        time.sleep(0.5)
+                    except (PlaywrightTimeoutError, Exception):
+                        print(f"Reached beginning of book after {rewind_i} Previous Chapter clicks.")
+                        break
+                time.sleep(3)
+            except Exception as e:
+                print(f"Error rewinding to beginning: {e}")
 
             # --- Step 3: Player Control and Forward Part Discovery ---
             initial_parts_count = len(downloaded_parts)
@@ -989,31 +1003,45 @@ def run():
                         except Exception as e:
                             print(f"  Signed URL fetch failed: {e}")
 
-                    # Method 2: Chapter navigation fallback
-                    if missing_part not in downloaded_parts:
-                        print(f"  Trying chapter navigation for Part {missing_part}...")
-                        player_fl = page.frame_locator('iframe[src*="listen.libbyapp.com"]')
-                        PREV_SELS = ['button[aria-label*="Previous Chapter"]', 'button[aria-label*="Previous chapter"]']
-                        for attempt in range(3):
-                            try:
-                                for _ in range(2):
-                                    for sel in PREV_SELS:
-                                        try:
-                                            player_fl.locator(sel).first.click(timeout=3000)
-                                            time.sleep(1)
-                                            break
-                                        except (PlaywrightTimeoutError, Exception):
-                                            continue
-                                time.sleep(5)
-                                if missing_part in downloaded_parts:
-                                    break
-                            except Exception as e:
-                                print(f"  Chapter nav attempt {attempt+1} failed: {e}")
-
                     if missing_part in downloaded_parts:
                         print(f"  Successfully retrieved Part {missing_part}!")
                     else:
                         print(f"  Failed to retrieve Part {missing_part}.")
+
+                # Method 2: Systematic forward scan from beginning for remaining missing parts
+                still_missing = [p for p in missing_parts if p not in downloaded_parts]
+                if still_missing:
+                    print(f"\nSystematic scan for {len(still_missing)} remaining missing parts: {still_missing}")
+                    player_fl = page.frame_locator('iframe[src*="listen.libbyapp.com"]')
+
+                    print("  Rewinding to beginning...")
+                    for _ in range(50):
+                        try:
+                            player_fl.locator('button[aria-label*="Previous Chapter"]').first.click(timeout=2000)
+                            time.sleep(0.5)
+                        except (PlaywrightTimeoutError, Exception):
+                            break
+                    time.sleep(3)
+
+                    print("  Scanning forward through all chapters...")
+                    for scan_i in range(100):
+                        remaining = [p for p in still_missing if p not in downloaded_parts]
+                        if not remaining:
+                            print(f"  All missing parts found after {scan_i} chapter scans!")
+                            break
+                        try:
+                            player_fl.locator('button[aria-label*="Next Chapter"]').first.click(timeout=3000)
+                            time.sleep(3)
+                            newly_found = [p for p in still_missing if p in downloaded_parts and p not in found_parts]
+                        except (PlaywrightTimeoutError, Exception):
+                            print(f"  End of book reached after {scan_i} chapter scans.")
+                            break
+
+                    final_missing = [p for p in missing_parts if p not in downloaded_parts]
+                    if final_missing:
+                        print(f"  Parts still missing after full scan: {final_missing}")
+                    else:
+                        print(f"  All parts successfully retrieved!")
 
             print("All download attempts complete.")
 
