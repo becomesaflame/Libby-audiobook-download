@@ -22,6 +22,23 @@ active_downloads_count = 0
 _latest_libby_part_number_trigger = None # Global variable to store the last part number seen in a Libby URL
 _libby_url_template = None # Captured from first part trigger, used to construct URLs for missing parts
 _signed_spine_urls = {} # spine_index -> full signed Libby URL, captured from openbook data
+_last_seen_part = 0 # Most recent part number triggered by Libby, in or out of order (used for gap detection)
+# The request handler ignores everything until this is True. It's flipped on only once
+# we've reached the rewind step, so the player's initial auto-load (its resume position
+# plus manifest requests, whose part numbers can mismatch the audio actually served)
+# can't mis-pair a wrong-part CDN download onto Part 1.
+downloads_enabled = False
+
+
+def next_expected_part():
+    """The next part we should accept: the smallest part number (from 1) not yet recorded.
+
+    Parts are only recorded in strict ascending order, so this is always one past the
+    contiguous run we've collected so far."""
+    expected = 1
+    while expected in found_parts:
+        expected += 1
+    return expected
 
 # --- Configuration Management Functions ---
 def load_config():
@@ -80,7 +97,14 @@ def handle_request(request):
     Callback function to process intercepted network requests.
     Identifies and downloads audiobook MP3 parts directly using requests library.
     """
-    global downloaded_parts, found_parts, max_part_number_found, active_downloads_count, _latest_libby_part_number_trigger, _libby_url_template
+    global downloaded_parts, found_parts, max_part_number_found, active_downloads_count, _latest_libby_part_number_trigger, _libby_url_template, _last_seen_part
+
+    # Ignore all traffic until we've reached the rewind step. During the player's initial
+    # auto-load, Libby fires manifest/resume requests whose part numbers don't reliably
+    # match the audio it actually streams, which would mis-pair a CDN download onto the
+    # wrong part (e.g. saving Part 5's audio as Part_01.mp3).
+    if not downloads_enabled:
+        return
 
     # Case 1: Intercept initial Libby part request (contains PartXX.mp3)
     # This request triggers the playback and sets up the session for the CDN download.
@@ -89,16 +113,29 @@ def handle_request(request):
         if part_match:
             part_number = int(part_match.group(1))
             with active_downloads_lock:
-                _latest_libby_part_number_trigger = part_number
-                found_parts.add(part_number)
+                # Always note the most recent triggered part (for gap detection) and
+                # cache its signed URL / URL template regardless of order.
+                _last_seen_part = part_number
                 if _libby_url_template is None:
                     _libby_url_template = re.sub(r'Part\d+\.mp3\?cmpt=.*', '', request.url)
                     print(f"Captured Libby URL template: {_libby_url_template}")
                 _signed_spine_urls[part_number] = request.url
-            print(f"Detected Libby part trigger: {request.url} -> Set _latest_libby_part_number_trigger to {part_number}")
+
+                # Only accept parts in strict ascending order. This means the player's
+                # resume-position jump (e.g. starting mid-book at Part 6) and chapter
+                # overshoots are NOT recorded, so they'll be captured "fresh" once we
+                # actually reach them in sequence.
+                expected = next_expected_part()
+                accepted = (part_number == expected)
+                if accepted:
+                    found_parts.add(part_number)
+                    _latest_libby_part_number_trigger = part_number
+            if accepted:
+                print(f"Detected in-order part trigger: Part {part_number} (accepted for download).")
+            else:
+                print(f"Ignoring out-of-order Part {part_number} trigger (expected Part {expected}); will capture it when reached in order.")
             # Do NOT attempt to get response body here, as it's typically empty or a redirect trigger.
             # We are just capturing the part number for the subsequent CDN request.
-            breakpoint()
             return # Exit early, this request is just a trigger
 
     # Case 2: Intercept actual CDN audio request (does NOT contain PartXX.mp3, relies on previous trigger)
@@ -134,16 +171,47 @@ def handle_request(request):
         file_name = f"Part_{part_number:02d}.mp3"
         file_path = os.path.join(config['DOWNLOAD_DIRECTORY'], file_name)
 
+        # Fast skip: if we already have this part on disk and it's the same size as
+        # the remote part, don't re-download it (saves lots of time on reruns/debugging).
+        # Probe the remote size cheaply with a 1-byte range request and read the total
+        # from the Content-Range header instead of pulling the whole ~35 MB body.
+        if os.path.exists(file_path):
+            local_size = os.path.getsize(file_path)
+            remote_size = None
+            try:
+                probe_headers = {k: v for k, v in request.headers.items() if k.lower() != "range"}
+                probe_headers["Range"] = "bytes=0-0"
+                probe = requests.get(cdn_audio_url, headers=probe_headers, timeout=30)
+                content_range = probe.headers.get("content-range", "")
+                if "/" in content_range:
+                    remote_size = int(content_range.rsplit("/", 1)[-1])
+                elif probe.headers.get("content-length"):
+                    remote_size = int(probe.headers["content-length"])
+            except Exception as e:
+                print(f"  Size probe for Part {part_number} failed ({e}); will download normally.")
+            if remote_size is not None and local_size == remote_size:
+                print(f"Skipping Part {part_number}: already on disk with matching size ({local_size} bytes).")
+                with active_downloads_lock:
+                    downloaded_parts.add(part_number)
+                    max_part_number_found = max(max_part_number_found, part_number)
+                    _latest_libby_part_number_trigger = None
+                return
+
         with active_downloads_lock:
             active_downloads_count += 1
         print(f"  Incremented active_downloads_count to: {active_downloads_count}")
 
         try:
             print(f"  Making direct requests.get() call for Part {part_number} to {cdn_audio_url}...")
-            # Use requests.get() to download the content directly
-            # Add headers from the original request to ensure session/auth is carried over if needed
+            # Use requests.get() to download the content directly.
+            # Copy the original request headers (to carry over session/auth) but force a
+            # full download: the browser's audio player often sends a Range header when it
+            # seeks/re-buffers, which would make the CDN return a partial (206) fragment.
+            # Requesting "bytes=0-" guarantees we always get the complete part from byte 0.
+            download_headers = {k: v for k, v in request.headers.items() if k.lower() != "range"}
+            download_headers["Range"] = "bytes=0-"
             # Set a timeout for the requests call to prevent indefinite hangs
-            download_response = requests.get(cdn_audio_url, headers=request.headers, timeout=60) # 60 seconds timeout
+            download_response = requests.get(cdn_audio_url, headers=download_headers, timeout=60) # 60 seconds timeout
 
             content_length = len(download_response.content)
             print(f"  Requests.get() Response Body Size: {content_length} bytes for Part {part_number}")
@@ -360,19 +428,26 @@ def run():
                 # Get all library choice buttons
                 library_choice_buttons = page.locator('.auth-ils-list button').all()
                 options_text = []
+                option_buttons = []
                 for i, button in enumerate(library_choice_buttons):
-                    # Extract text, stripping whitespace and filtering out empty strings
-                    text = button.text_content().strip()
+                    # inner_text() keeps line breaks between child elements (e.g. the
+                    # option name and a "Recommended choice." badge); join them visibly.
+                    text = button.inner_text().strip()
                     if text: # Only add non-empty text
+                        text = ' — '.join(line.strip() for line in text.splitlines() if line.strip())
                         options_text.append(text)
+                        option_buttons.append(button)
 
                 if not options_text:
                     print("No library card usage options found on the page.")
                     return
 
-                # If the option index is not in config or invalid, prompt the user
+                # If the option index is not in config or invalid, list the options and prompt the user
                 if 'LIBRARY_CARD_USAGE_OPTION_INDEX' not in config or \
                    not (0 <= config['LIBRARY_CARD_USAGE_OPTION_INDEX'] < len(options_text)):
+                    print("Where do you use your library card?")
+                    for i, option in enumerate(options_text):
+                        print(f"{i+1}. {option}")
                     while True:
                         try:
                             choice = input("Enter the number of your choice: ")
@@ -389,18 +464,19 @@ def run():
                     print(f"Using saved library card usage option: {options_text[config['LIBRARY_CARD_USAGE_OPTION_INDEX']]}")
 
                 # Click the corresponding button based on the stored/selected index
-                selected_option_text = options_text[config['LIBRARY_CARD_USAGE_OPTION_INDEX']]
-                # Using triple double quotes for robustness in f-string
-                page.click(f"""button:has-text("{selected_option_text}") >> nth={config['LIBRARY_CARD_USAGE_OPTION_INDEX']}""")
-                page.wait_for_load_state('networkidle')
+                option_buttons[config['LIBRARY_CARD_USAGE_OPTION_INDEX']].click(timeout=10000)
+                try:
+                    page.wait_for_load_state('networkidle', timeout=15000)
+                except PlaywrightTimeoutError:
+                    print("Note: network did not go idle after selecting card usage option; continuing anyway.")
                 time.sleep(3)
                 # Fix: Separated f-string for filename from os.path.join
                 filename = f"07_after_select_card_usage_{config['LIBRARY_CARD_USAGE_OPTION_INDEX']+1}.png"
                 screenshot_path = os.path.join(config['DOWNLOAD_DIRECTORY'], filename)
                 page.screenshot(path=screenshot_path)
 
-            except PlaywrightTimeoutError:
-                print("Error: Library card usage options did not appear in time.")
+            except PlaywrightTimeoutError as e:
+                print(f"Error: timed out during library card usage option step: {e}")
                 return
             except Exception as e:
                 print(f"An error occurred while handling library card usage options: {e}")
@@ -540,11 +616,11 @@ def run():
                 for i, title in enumerate(audiobook_titles):
                     print(f"{i+1}. {title}")
 
-                # Select audiobook (auto or manual based on configuration)
-                if AUTO_SELECT_FIRST_AUDIOBOOK:
+                # Select audiobook (auto-select only when there's a single option)
+                if AUTO_SELECT_FIRST_AUDIOBOOK and len(audiobook_titles) == 1:
                     choice_index = 0
                     selected_title = audiobook_titles[choice_index]
-                    print(f"Auto-selected first audiobook: '{selected_title}'")
+                    print(f"Auto-selected the only audiobook on the shelf: '{selected_title}'")
                 else:
                     # Loop until a valid choice is made
                     selected_title = None
@@ -598,12 +674,50 @@ def run():
             screenshot_path = os.path.join(config['DOWNLOAD_DIRECTORY'], "16_after_audiobook_detail_load.png")
             page.screenshot(path=screenshot_path)
 
-            # Navigate to the beginning of the book so the forward pass starts from Part 1
+            # Navigate to the beginning of the book so the forward pass starts from Part 1.
+            # Recording is gated to strict ascending order (see handle_request), so the
+            # resume position that loaded above was ignored; Part 1 will be the first part
+            # accepted once the rewind navigation triggers it.
+            global downloads_enabled
             try:
                 player_frame_init = page.frame_locator('iframe[src*="listen.libbyapp.com"]')
-                for rewind_i in range(50):
+                prev_btn = player_frame_init.locator('button[aria-label*="Previous Chapter"]')
+                # Wait for the player to be ready before rewinding, keyed on the Next Chapter
+                # button. That button is present throughout the book, whereas Previous Chapter
+                # is hidden at the very start - so waiting on Previous Chapter would stall for
+                # the full timeout whenever the book opens at/near the beginning.
+                try:
+                    player_frame_init.locator('button[aria-label*="Next Chapter"]').first.wait_for(state='visible', timeout=60000)
+                except PlaywrightTimeoutError:
+                    print("Warning: player controls did not become visible within 60s; rewind may fail.")
+
+                # The initial auto-load (resume position + manifest traffic) is done. Enable
+                # the handler now so the rewind navigation's Part 1 trigger is the first
+                # thing captured - not the mid-book resume position that loaded above.
+                downloads_enabled = True
+                print("Rewind step reached: request handler enabled, capturing from Part 1 onward.")
+
+                # If Libby shows a "Recent place" history-back button pointing near the
+                # start of the book, click it to jump straight there instead of stepping
+                # back one chapter at a time.
+                try:
+                    back_btn = player_frame_init.locator('button.history-bar-back-button')
+                    if back_btn.count() > 0 and back_btn.first.is_visible():
+                        place_text = back_btn.first.locator('.place-phrase-visual').first.text_content().strip()
+                        total_sec = 0
+                        for segment in place_text.split(':'):
+                            total_sec = total_sec * 60 + int(segment)
+                        if total_sec == 0:
+                            print(f"History-back button offers recent place {place_text}; jumping straight to it.")
+                            back_btn.first.click(timeout=3000)
+                            time.sleep(3)
+                        else:
+                            print(f"History-back button present but points to {place_text}; ignoring it.")
+                except Exception as e:
+                    print(f"History-back shortcut not used: {e}")
+
+                for rewind_i in range(300):
                     try:
-                        prev_btn = player_frame_init.locator('button[aria-label*="Previous Chapter"]')
                         prev_btn.first.click(timeout=2000)
                         time.sleep(0.5)
                     except (PlaywrightTimeoutError, Exception):
@@ -619,277 +733,112 @@ def run():
             MAX_NO_NEW_PARTS_ITERATIONS = 10 # Stop if no new parts found for this many clicks
             MAX_FORWARD_CLICKS = 500 # Safety limit for forward clicks
 
-            # Selector for forward navigation - "Next Chapter" button (aria-label e.g. "Next Chapter . 12 minutes ahead.")
-            # Minutes value varies by chapter, so match only the fixed part of the label.
-            FORWARD_SELECTORS = [
-                'button[aria-label*="Next Chapter"]',  # Next chapter (label varies: "Next Chapter . N minutes ahead.")
-                'button.chapter-bar-next-button',
-                'button[aria-label*="next chapter"]',
-                'button[aria-label*="Advance 15 seconds"]',  # Fallback: 15s skip
-                'button.mini-player-jump-ahead',
-            ]
-
-            MAX_REWIND_CLICKS = 40  # ~10 minutes of rewind (15s per click) to find a missed part
-            REWIND_WAIT_SEC = 3    # Wait after each rewind click for part to load
+            MAX_GAP_SKIP_CLICKS = 200  # ~50 minutes of audio (15s per click) to scan a chapter for a missed part
+            GAP_SKIP_WAIT_SEC = 2      # Wait after each 15s skip for the part trigger to fire
 
             for i in range(MAX_FORWARD_CLICKS):
                 current_parts_count = len(downloaded_parts)
-                expected_next_part = max_part_number_found + 1  # Consecutive part we expect next
+                expected_next_part = next_expected_part()  # Next part we still need, in order
                 print(f"Forward pass iteration {i+1}. Current parts downloaded: {current_parts_count} (expect next part {expected_next_part})")
 
-                # Try to find the "Next Chapter" button (advances to next part; label e.g. "Next Chapter . 12 minutes ahead.")
-                # The Libby player runs in an iframe (listen.libbyapp.com); the button is inside it at index 12.
-                button_found = False
+                # Advance with the "Next Chapter" button only (aria-label match). This has
+                # proven reliable; the old fallback selectors (chapter-bar-next-button,
+                # 15s-skip, JS clicks) were removed because they stay present-but-hidden at
+                # the end of the book and kept the loop "advancing" forever.
+                player_frame = page.frame_locator('iframe[src*="listen.libbyapp.com"]')
+                next_chapter_btn = player_frame.locator('button[aria-label*="Next Chapter"]')
 
-                # First: target the Libby player iframe and click Next Chapter (aria-label contains "Next Chapter", minutes vary)
+                # Log the button's state every iteration so its behaviour (especially at the
+                # end of the book, where it becomes present-but-hidden) is always visible.
+                nc_count = -1
+                nc_visible = False
+                nc_aria = None
+                nc_bbox = None
                 try:
-                    player_frame = page.frame_locator('iframe[src*="listen.libbyapp.com"]')
-                    next_chapter_btn = player_frame.locator('button[aria-label*="Next Chapter"]')
+                    nc_count = next_chapter_btn.count()
+                    if nc_count > 0:
+                        first_btn = next_chapter_btn.first
+                        nc_visible = first_btn.is_visible()
+                        nc_aria = first_btn.get_attribute('aria-label')
+                        nc_bbox = first_btn.bounding_box()
+                except Exception as e:
+                    print(f"  [next-chapter] error reading button metadata: {e}")
+                print(f"  [next-chapter] count={nc_count} visible={nc_visible} aria-label={nc_aria!r} bbox={nc_bbox}")
+
+                # End of book: the Next Chapter button is gone or no longer visible (it stays
+                # in the DOM but hidden on the last chapter). Playback never reaches the true
+                # audio end via chapter skips, so this - not the play button's "The End"
+                # text - is our stop signal.
+                if nc_count == 0 or not nc_visible:
+                    print("End of book detected: 'Next Chapter' button is not present/visible. Stopping forward pass.")
+                    break
+
+                button_found = False
+                try:
                     next_chapter_btn.first.click(timeout=2000)
-                    print("Found forward button in player iframe (Next Chapter)")
+                    print("  Clicked Next Chapter.")
                     button_found = True
                     time.sleep(5)
-                except (PlaywrightTimeoutError, Exception):
-                    pass
+                except (PlaywrightTimeoutError, Exception) as e:
+                    print(f"  Next Chapter click failed despite being visible: {e}")
+                    break # Treat an unclickable button as end of book
 
-                # Fallback: check other iframes with FORWARD_SELECTORS
-                if not button_found:
-                    try:
-                        iframes = page.locator('iframe').all()
-                        for iframe_locator in iframes:
+                # Gap recovery: chapters can span multiple audio parts, so a Next
+                # Chapter jump can skip over the start of a part entirely (e.g. it lands
+                # on Part 6 while Part 5 was never played). Because recording is gated to
+                # ascending order, the skipped part simply never got accepted: the next
+                # expected part is still missing even though we've now seen a higher part.
+                # When that happens, step back chapter-by-chapter until the player is
+                # positioned BEFORE the missing part, then advance in 15s steps; each
+                # skipped part triggers in order and is accepted as we pass through it.
+                if button_found:
+                    time.sleep(2)  # let the part trigger from the chapter jump arrive
+                    landed = _last_seen_part  # highest part the player has reached so far
+                    missing_part = expected_next_part
+                    if landed > missing_part:
+                        print(f"Gap detected: player reached Part {landed} but Part {missing_part} was skipped. Stepping back to before Part {missing_part}...")
+                        player_frame = page.frame_locator('iframe[src*="listen.libbyapp.com"]')
+                        prev_chapter_btn = player_frame.locator('button[aria-label*="Previous Chapter"]')
+
+                        # Step back one chapter at a time until the player lands on a part
+                        # earlier than the one we're missing (a single chapter back is often
+                        # not enough - the skipped part can start several chapters earlier).
+                        MAX_BACK_CHAPTERS = 15
+                        back_clicks = 0
+                        while back_clicks < MAX_BACK_CHAPTERS:
                             try:
-                                # content_frame is a property (not a method); use .locator().first, not Frame API
-                                iframe_frame = iframe_locator.content_frame
-                                if iframe_frame:
-                                    for selector in FORWARD_SELECTORS:
-                                        try:
-                                            iframe_frame.locator(selector).first.wait_for(state='visible', timeout=2000)
-                                            print(f"Found forward button in iframe with selector: {selector}")
-                                            iframe_frame.locator(selector).first.click()
-                                            button_found = True
-                                            time.sleep(5)
-                                            break
-                                        except PlaywrightTimeoutError:
-                                            continue
-                                        except Exception as e:
-                                            print(f"Error with iframe selector {selector}: {e}")
-                                            continue
-                                    if button_found:
-                                        break
-                            except Exception as e:
-                                print(f"Error accessing iframe: {e}")
-                                continue
-                    except Exception as e:
-                        print(f"Error checking for iframes: {e}")
-
-                # If not found in iframe, try main page
-                if not button_found:
-                    for selector in FORWARD_SELECTORS:
-                        try:
-                            page.wait_for_selector(selector, timeout=2000)
-                            print(f"Found forward button with selector: {selector}")
-                            page.click(selector)
-                            button_found = True
-
-                            if button_found:
-                                time.sleep(5) # Reduced sleep time here
+                                prev_chapter_btn.first.click(timeout=3000)
+                            except (PlaywrightTimeoutError, Exception) as e:
+                                print(f"  Reached start of book while stepping back ({e}).")
                                 break
-                        except PlaywrightTimeoutError:
-                            continue # Try next selector
-                        except Exception as e:
-                            print(f"Error with selector {selector}: {e}")
-                            continue # Try next selector
-                
-                # Last resort: try JavaScript click (works even if button is in iframe)
-                if not button_found:
-                    try:
-                        result = page.evaluate("""
-                            () => {
-                                const btn = document.querySelector('button.mini-player-jump-ahead');
-                                if (btn) {
-                                    btn.click();
-                                    return {success: true, found: true};
-                                }
-                                // Also check in iframes
-                                const iframes = document.querySelectorAll('iframe');
-                                for (let iframe of iframes) {
-                                    try {
-                                        const iframeDoc = iframe.contentDocument || iframe.contentWindow.document;
-                                        const iframeBtn = iframeDoc.querySelector('button.mini-player-jump-ahead');
-                                        if (iframeBtn) {
-                                            iframeBtn.click();
-                                            return {success: true, found: true, inIframe: true};
-                                        }
-                                    } catch (e) {
-                                        // Cross-origin iframe, can't access
-                                    }
-                                }
-                                return {success: false, found: false};
-                            }
-                        """)
-                        if result.get('success'):
-                            print(f"Successfully clicked forward button via JavaScript (in iframe: {result.get('inIframe', False)})")
-                            button_found = True
-                            time.sleep(5)
-                    except Exception as e:
-                        print(f"JavaScript click attempt failed: {e}")
+                            back_clicks += 1
+                            time.sleep(2)
+                            if _last_seen_part and _last_seen_part < missing_part:
+                                print(f"  Stepped back {back_clicks} chapter(s) to Part {_last_seen_part}; now scanning forward for Part {missing_part}.")
+                                break
+                        else:
+                            print(f"  Stepped back {back_clicks} chapters (cap reached); scanning forward from here.")
 
-                if not button_found:
-                    print("No forward button found with any selector. Debugging...")
-                    # Take screenshot for debugging
-                    debug_screenshot = os.path.join(config['DOWNLOAD_DIRECTORY'], f"debug_no_next_button_{i+1}.png")
-                    page.screenshot(path=debug_screenshot)
-                    print(f"Debug screenshot saved: {debug_screenshot}")
-
-                    # Print all visible buttons on current page for debugging
-                    try:
-                        # Wait a moment for DOM to stabilize
-                        time.sleep(2)
-                        all_buttons = page.locator('button:visible').all()
-                        print(f"Found {len(all_buttons)} visible buttons on current page:")
-                        for idx, button in enumerate(all_buttons):  
+                        skip_btn = player_frame.locator('button[aria-label*="Advance 15 seconds"], button.mini-player-jump-ahead')
+                        skip_clicks = 0
+                        # 15s-skip to fill the parts SKIPPED between expected and the part
+                        # we overshot to (< landed). `landed` sits at a chapter boundary, so
+                        # once the in-between parts are captured we stop and let the normal
+                        # Next Chapter click reach it in the next iteration.
+                        while next_expected_part() < landed and skip_clicks < MAX_GAP_SKIP_CLICKS:
                             try:
-                                text = button.text_content()[:50] if button.text_content() else "No text"
-                                classes = button.get_attribute('class') or "No classes"
-                                aria_label = button.get_attribute('aria-label') or "No aria-label"
-                                # Check if button is actually in viewport
-                                is_visible = button.is_visible()
-                                bounding_box = button.bounding_box()
-                                print(f"  Button {idx}: text='{text}' class='{classes}' aria-label='{aria_label}' visible={is_visible} bbox={bounding_box}")
-                            except Exception as e:
-                                print(f"  Button {idx}: Could not read properties - {e}")
-                        
-                        # Also check for buttons with the specific selectors we're looking for
-                        print("\n=== DETAILED ANALYSIS OF FORWARD BUTTONS ===")
-                        for selector in FORWARD_SELECTORS:
-                            try:
-                                matching_buttons = page.locator(selector).all()
-                                print(f"\nSelector '{selector}': {len(matching_buttons)} total buttons found")
-                                
-                                for idx, btn in enumerate(matching_buttons):
-                                    try:
-                                        # Get basic info
-                                        text = btn.text_content()[:50] if btn.text_content() else "No text"
-                                        classes = btn.get_attribute('class') or "No classes"
-                                        aria_label = btn.get_attribute('aria-label') or "No aria-label"
-                                        
-                                        # Check visibility details
-                                        is_visible = btn.is_visible()
-                                        bounding_box = btn.bounding_box()
-                                        
-                                        # Get computed styles to understand why it might not be visible
-                                        computed_styles = page.evaluate("""
-                                            ([selector, index]) => {
-                                                const buttons = document.querySelectorAll(selector);
-                                                if (buttons[index]) {
-                                                    const btn = buttons[index];
-                                                    const styles = window.getComputedStyle(btn);
-                                                    return {
-                                                        display: styles.display,
-                                                        visibility: styles.visibility,
-                                                        opacity: styles.opacity,
-                                                        pointerEvents: styles.pointerEvents,
-                                                        zIndex: styles.zIndex,
-                                                        position: styles.position,
-                                                        width: styles.width,
-                                                        height: styles.height,
-                                                        offsetParent: btn.offsetParent !== null,
-                                                        clientWidth: btn.clientWidth,
-                                                        clientHeight: btn.clientHeight,
-                                                        offsetWidth: btn.offsetWidth,
-                                                        offsetHeight: btn.offsetHeight
-                                                    };
-                                                }
-                                                return null;
-                                            }
-                                        """, [selector, idx])
-                                        
-                                        print(f"  Button {idx}:")
-                                        print(f"    text='{text}'")
-                                        print(f"    class='{classes}'")
-                                        print(f"    aria-label='{aria_label}'")
-                                        print(f"    is_visible()={is_visible}")
-                                        print(f"    bounding_box={bounding_box}")
-                                        if computed_styles:
-                                            print(f"    CSS display={computed_styles['display']}")
-                                            print(f"    CSS visibility={computed_styles['visibility']}")
-                                            print(f"    CSS opacity={computed_styles['opacity']}")
-                                            print(f"    offsetParent exists={computed_styles['offsetParent']}")
-                                            print(f"    dimensions: {computed_styles['width']} x {computed_styles['height']}")
-                                            print(f"    actual size: {computed_styles['clientWidth']} x {computed_styles['clientHeight']}")
-                                        
-                                        # Check if it's in an iframe
-                                        try:
-                                            frame = btn.content_frame
-                                            if frame:
-                                                print(f"    ⚠️  BUTTON IS IN AN IFRAME!")
-                                        except:
-                                            pass
-                                        
-                                    except Exception as e:
-                                        print(f"  Button {idx}: Error getting details - {e}")
-                                        
-                            except Exception as e:
-                                print(f"  Selector '{selector}': Error - {e}")
-                        
-                        # Check for iframes on the page
-                        print("\n=== CHECKING FOR IFRAMES ===")
-                        try:
-                            iframes = page.locator('iframe').all()
-                            print(f"Found {len(iframes)} iframes on the page")
-                            for idx, iframe_locator in enumerate(iframes):
-                                try:
-                                    src = iframe_locator.get_attribute('src') or "No src"
-                                    print(f"  Iframe {idx}: src='{src[:100]}'")
-                                    # Try to find buttons inside iframe
-                                    try:
-                                        iframe_frame = iframe_locator.content_frame
-                                        if iframe_frame:
-                                            print(f"    Successfully accessed iframe frame object!")
-                                            iframe_buttons = iframe_frame.locator('button.mini-player-jump-ahead').all()
-                                            print(f"    Found {len(iframe_buttons)} skip buttons inside this iframe!")
-                                            # Also check all forward selectors in iframe
-                                            for sel in FORWARD_SELECTORS:
-                                                iframe_sel_buttons = iframe_frame.locator(sel).all()
-                                                if iframe_sel_buttons:
-                                                    visible_in_iframe = [b for b in iframe_sel_buttons if b.is_visible()]
-                                                    print(f"    Found {len(iframe_sel_buttons)} buttons ({len(visible_in_iframe)} visible) with selector '{sel}' in iframe!")
-                                    except Exception as e:
-                                        print(f"    Error accessing iframe content: {e}")
-                                        import traceback
-                                        traceback.print_exc()
-                                except:
-                                    pass
-                        except Exception as e:
-                            print(f"Error checking iframes: {e}")
-                        
-                        # Try force-clicking the button via JavaScript (even if Playwright thinks it's not visible)
-                        print("\n=== ATTEMPTING FORCE CLICK VIA JAVASCRIPT ===")
-                        try:
-                            result = page.evaluate("""
-                                () => {
-                                    const btn = document.querySelector('button.mini-player-jump-ahead');
-                                    if (btn) {
-                                        // Try to click it
-                                        btn.click();
-                                        return {success: true, found: true};
-                                    }
-                                    return {success: false, found: false};
-                                }
-                            """)
-                            print(f"JavaScript click attempt: {result}")
-                        except Exception as e:
-                            print(f"Error with JavaScript click: {e}")
-                    except Exception as e:
-                        print(f"Error listing buttons: {e}")
-                        import traceback
-                        traceback.print_exc()
-
-                    break # Exit loop if button is not found (likely end of book)
-
-                # Note: chapters span multiple audio parts, so chapter navigation
-                # will skip parts that fall mid-chapter. These are handled in Step 4
-                # using direct spine navigation instead of the slow button-click approach.
+                                skip_btn.first.click(timeout=3000)
+                            except (PlaywrightTimeoutError, Exception) as e:
+                                print(f"  15s advance failed during gap recovery: {e}")
+                                break
+                            skip_clicks += 1
+                            time.sleep(GAP_SKIP_WAIT_SEC)
+                            if skip_clicks % 20 == 0:
+                                print(f"  Gap recovery: {skip_clicks} skips so far, next still-missing part is {next_expected_part()} (filling up to {landed - 1})")
+                        if next_expected_part() < landed:
+                            print(f"  Gap recovery gave up after {skip_clicks} skips; Part {next_expected_part()} still missing (Step 4 will retry).")
+                        else:
+                            print(f"  Gap recovery done after {skip_clicks} 15s skips; parts up to {landed - 1} captured. Resuming chapter skips to reach Part {landed}.")
 
                 if len(downloaded_parts) == current_parts_count:
                     no_new_parts_count += 1
