@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import time
 import requests
 import json # Import the json library for config file handling
@@ -9,6 +10,39 @@ from playwright_stealth import Stealth # Import the stealth library
 
 # --- Configuration File Path ---
 CONFIG_FILE = 'libby_config.json'
+RUN_LOG_FILE = 'libby_run.log'
+
+
+class _Tee:
+    """Mirror writes to several streams. Used to copy all console output into a
+    log file, because diagnostic lines scroll out of the terminal buffer long
+    before a run finishes."""
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, data):
+        for s in self._streams:
+            s.write(data)
+            s.flush()
+
+    def flush(self):
+        for s in self._streams:
+            s.flush()
+
+
+_log_file = None  # Set in __main__; target for log_only()
+
+
+def log_only(msg):
+    """Write a line to the run log file only, skipping the console. For noisy
+    diagnostics (e.g. unmatched-CDN-request spam) that clog the printout but
+    are still useful when digging through a run afterwards."""
+    if _log_file:
+        try:
+            _log_file.write(msg + "\n")
+            _log_file.flush()
+        except Exception:
+            pass
 
 # --- Testing Configuration ---
 AUTO_SELECT_FIRST_AUDIOBOOK = True  # Set to False for manual selection
@@ -23,6 +57,8 @@ _latest_libby_part_number_trigger = None # Global variable to store the last par
 _libby_url_template = None # Captured from first part trigger, used to construct URLs for missing parts
 _signed_spine_urls = {} # spine_index -> full signed Libby URL, captured from openbook data
 _last_seen_part = 0 # Most recent part number triggered by Libby, in or out of order (used for gap detection)
+max_part_number_seen = 0 # Highest part number seen in ANY trigger, even out-of-order/unaccepted ones
+_trigger_seq = 0 # Bumped on every part trigger; lets seek probes wait for a FRESH trigger instead of reading stale state
 # The request handler ignores everything until this is True. It's flipped on only once
 # we've reached the rewind step, so the player's initial auto-load (its resume position
 # plus manifest requests, whose part numbers can mismatch the audio actually served)
@@ -39,6 +75,106 @@ def next_expected_part():
     while expected in found_parts:
         expected += 1
     return expected
+
+
+SNAPSHOT_DIR = 'snapshots'
+
+
+def save_snapshot(page, name):
+    """Save a full-page screenshot plus the page's and player iframe's HTML under
+    snapshots/, so element structure at each screen can be inspected offline."""
+    try:
+        os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+        base = os.path.join(SNAPSHOT_DIR, f"{time.strftime('%Y%m%d-%H%M%S')}_{name}")
+        page.screenshot(path=f"{base}.png", full_page=True)
+        with open(f"{base}.html", 'w') as f:
+            f.write(page.content())
+        for frame in page.frames:
+            if 'listen.libbyapp.com' in frame.url:
+                with open(f"{base}_player_iframe.html", 'w') as f:
+                    f.write(frame.content())
+                break
+        print(f"  [snapshot] saved {base}.(png|html)")
+    except Exception as e:
+        print(f"  [snapshot] failed for {name}: {e}")
+
+
+# The Libby player's scrubber is the "seekometer": a horizontal tape that spans
+# the ENTIRE book, time-linear at 2px per second of audio. Its CSS transform
+# (translate3d(-<px>, 0, 0)) is the playhead position, and dragging the tape
+# left/right seeks. See snapshots/*_player_iframe.html for the captured DOM.
+TAPE_PX_PER_SEC = 2.0
+
+
+def tape_position_px(player_frame):
+    """Current playhead position on the seekometer tape in px, or None."""
+    try:
+        tape = player_frame.locator('.seekometer-tape').first
+        transform = tape.evaluate("el => window.getComputedStyle(el).transform")
+        m = re.search(r'matrix\(([^)]+)\)', transform or '')
+        if not m:
+            return None
+        tx = float(m.group(1).split(',')[4])
+        return -tx
+    except Exception as e:
+        print(f"  [tape-seek] could not read tape position: {e}")
+        return None
+
+
+def seek_tape_to_px(page, player_frame, target_px):
+    """Drag the seekometer tape until the playhead sits at target_px.
+
+    Dragging the tape left advances the playhead. One drag gesture can cover at
+    most ~one viewport width, so this runs closed-loop: read the tape transform,
+    drag up to 80% of the visible tape width, wait for the ease-out transition
+    to settle, re-read, repeat. Returns the final position, or None on failure."""
+    try:
+        clip = player_frame.locator('.seekometer').first
+        box = clip.bounding_box()
+    except Exception:
+        box = None
+    if not box or box['width'] < 50:
+        return None
+    cy = box['y'] + box['height'] / 2
+    cur = None
+    no_move_count = 0
+    for _ in range(60):
+        prev = cur
+        cur = tape_position_px(player_frame)
+        if cur is None:
+            return None
+        delta = target_px - cur
+        # Loose tolerance (~30s of audio): probes are classified by where they
+        # actually landed, so pixel precision buys nothing and chasing it makes
+        # the loop fight the tape's snap/ease animations.
+        if abs(delta) <= 60:
+            return cur
+        if prev is not None and abs(cur - prev) < 1.0:
+            no_move_count += 1
+            if no_move_count >= 3:
+                print(f"  [tape-seek] tape not responding to drags (stuck at {cur:.0f}px, want {target_px:.0f}px).")
+                return None
+        else:
+            no_move_count = 0
+        max_step = box['width'] * 0.8
+        step = max(-max_step, min(max_step, delta))
+        # Start the gesture offset from center so both ends stay inside the tape.
+        sx_start = box['x'] + box['width'] / 2 + step / 2
+        sx_end = sx_start - step
+        try:
+            # Drag slowly and hold still before releasing: a fast flick gives the
+            # tape momentum, so it coasts past the target (firing part triggers
+            # for positions merely passed over) and never settles where asked.
+            page.mouse.move(sx_start, cy)
+            page.mouse.down()
+            page.mouse.move(sx_end, cy, steps=25)
+            time.sleep(0.4)
+            page.mouse.up()
+        except Exception as e:
+            print(f"  [tape-seek] drag gesture failed: {e}")
+            return None
+        time.sleep(0.8)  # tape has a 500ms ease-out transition
+    return cur
 
 # --- Configuration Management Functions ---
 def load_config():
@@ -97,7 +233,7 @@ def handle_request(request):
     Callback function to process intercepted network requests.
     Identifies and downloads audiobook MP3 parts directly using requests library.
     """
-    global downloaded_parts, found_parts, max_part_number_found, active_downloads_count, _latest_libby_part_number_trigger, _libby_url_template, _last_seen_part
+    global downloaded_parts, found_parts, max_part_number_found, active_downloads_count, _latest_libby_part_number_trigger, _libby_url_template, _last_seen_part, max_part_number_seen, _trigger_seq
 
     # Ignore all traffic until we've reached the rewind step. During the player's initial
     # auto-load, Libby fires manifest/resume requests whose part numbers don't reliably
@@ -116,6 +252,8 @@ def handle_request(request):
                 # Always note the most recent triggered part (for gap detection) and
                 # cache its signed URL / URL template regardless of order.
                 _last_seen_part = part_number
+                max_part_number_seen = max(max_part_number_seen, part_number)
+                _trigger_seq += 1
                 if _libby_url_template is None:
                     _libby_url_template = re.sub(r'Part\d+\.mp3\?cmpt=.*', '', request.url)
                     print(f"Captured Libby URL template: {_libby_url_template}")
@@ -141,7 +279,9 @@ def handle_request(request):
     # Case 2: Intercept actual CDN audio request (does NOT contain PartXX.mp3, relies on previous trigger)
     elif "audioclips.cdn.overdrive.com" in request.url:
         if _latest_libby_part_number_trigger is None:
-            print(f"Skipping CDN request {request.url}: No preceding Libby part trigger found. This might be an unrelated CDN asset.")
+            # Log-only: this fires constantly (every re-buffer of an already-handled
+            # part) and would drown out the console output.
+            log_only(f"Skipping CDN request {request.url}: No preceding Libby part trigger found. This might be an unrelated CDN asset.")
             return
 
         part_number = _latest_libby_part_number_trigger
@@ -578,6 +718,7 @@ def run():
 
             # --- Prompt user for audiobook selection on the shelf ---
             print("\nAudiobooks on your Shelf:")
+            save_snapshot(page, "shelf")
             try:
                 # Wait for audiobook tiles to be visible
                 page.wait_for_selector('.title-list-tiles .title-tile', timeout=15000)
@@ -616,8 +757,18 @@ def run():
                 for i, title in enumerate(audiobook_titles):
                     print(f"{i+1}. {title}")
 
+                # Non-interactive preselect by title (for unattended/testing runs):
+                # LIBBY_BOOK_TITLE=Wicked picks the first shelf title containing the
+                # string, case-insensitively. Shelf order is not stable, so piping a
+                # number into stdin can select the wrong book.
+                preselect_title = os.environ.get('LIBBY_BOOK_TITLE', '').strip()
+                preselect_matches = [i for i, t in enumerate(audiobook_titles) if preselect_title and preselect_title.lower() in t.lower()]
+                if preselect_matches:
+                    choice_index = preselect_matches[0]
+                    selected_title = audiobook_titles[choice_index]
+                    print(f"Preselected via LIBBY_BOOK_TITLE={preselect_title!r}: '{selected_title}'")
                 # Select audiobook (auto-select only when there's a single option)
-                if AUTO_SELECT_FIRST_AUDIOBOOK and len(audiobook_titles) == 1:
+                elif AUTO_SELECT_FIRST_AUDIOBOOK and len(audiobook_titles) == 1:
                     choice_index = 0
                     selected_title = audiobook_titles[choice_index]
                     print(f"Auto-selected the only audiobook on the shelf: '{selected_title}'")
@@ -671,6 +822,7 @@ def run():
 
             print("Audiobook player opened. Rewinding to beginning...")
             time.sleep(5)
+            save_snapshot(page, "player_opened")
             screenshot_path = os.path.join(config['DOWNLOAD_DIRECTORY'], "16_after_audiobook_detail_load.png")
             page.screenshot(path=screenshot_path)
 
@@ -733,8 +885,10 @@ def run():
             MAX_NO_NEW_PARTS_ITERATIONS = 10 # Stop if no new parts found for this many clicks
             MAX_FORWARD_CLICKS = 500 # Safety limit for forward clicks
 
-            MAX_GAP_SKIP_CLICKS = 200  # ~50 minutes of audio (15s per click) to scan a chapter for a missed part
-            GAP_SKIP_WAIT_SEC = 2      # Wait after each 15s skip for the part trigger to fire
+            MAX_SEEK_PROBES = 20          # Binary-search probes per missing part (resolution ~1/2^20 of the slider)
+            SEEK_TRIGGER_TIMEOUT_SEC = 12  # Max wait for a fresh part trigger after a seek probe (the player defers loading after rapid scrubs)
+            MAX_GAP_SKIP_CLICKS = 200     # Fallback 15s-skip budget floor when no seek slider is found
+            GAP_SKIP_WAIT_SEC = 2         # Wait after each seek/skip for the part trigger to fire
 
             for i in range(MAX_FORWARD_CLICKS):
                 current_parts_count = len(downloaded_parts)
@@ -771,6 +925,7 @@ def run():
                 # text - is our stop signal.
                 if nc_count == 0 or not nc_visible:
                     print("End of book detected: 'Next Chapter' button is not present/visible. Stopping forward pass.")
+                    save_snapshot(page, "end_of_book")
                     break
 
                 button_found = False
@@ -797,7 +952,12 @@ def run():
                     missing_part = expected_next_part
                     if landed > missing_part:
                         print(f"Gap detected: player reached Part {landed} but Part {missing_part} was skipped. Stepping back to before Part {missing_part}...")
+                        save_snapshot(page, f"gap_recovery_part{missing_part}")
                         player_frame = page.frame_locator('iframe[src*="listen.libbyapp.com"]')
+                        # We're sitting at the overshoot chapter's start right now: the
+                        # missing part's boundary lies BEFORE this tape position. Record it
+                        # as the upper bound for the seek search below.
+                        gap_hi_px = tape_position_px(player_frame)
                         prev_chapter_btn = player_frame.locator('button[aria-label*="Previous Chapter"]')
 
                         # Step back one chapter at a time until the player lands on a part
@@ -819,26 +979,117 @@ def run():
                         else:
                             print(f"  Stepped back {back_clicks} chapters (cap reached); scanning forward from here.")
 
-                        skip_btn = player_frame.locator('button[aria-label*="Advance 15 seconds"], button.mini-player-jump-ahead')
-                        skip_clicks = 0
-                        # 15s-skip to fill the parts SKIPPED between expected and the part
-                        # we overshot to (< landed). `landed` sits at a chapter boundary, so
-                        # once the in-between parts are captured we stop and let the normal
-                        # Next Chapter click reach it in the next iteration.
-                        while next_expected_part() < landed and skip_clicks < MAX_GAP_SKIP_CLICKS:
+                        # Binary-search the seekometer tape for the missing part(s).
+                        # The tape is time-linear over the whole book (2px/sec), so seeking
+                        # to a tape position triggers that position's part request, and
+                        # position -> part number is monotonic: each probe halves the
+                        # interval. The order gate reads out the result: overshoot probes
+                        # are ignored, and the probe that lands inside the target part is
+                        # the expected one, so it's accepted and downloads.
+                        # Search between here (known to be in a part < target after the
+                        # step-back) and the overshoot chapter's start captured above.
+                        lo = tape_position_px(player_frame)
+                        hi = gap_hi_px
+                        if hi is None:
                             try:
-                                skip_btn.first.click(timeout=3000)
-                            except (PlaywrightTimeoutError, Exception) as e:
-                                print(f"  15s advance failed during gap recovery: {e}")
-                                break
-                            skip_clicks += 1
-                            time.sleep(GAP_SKIP_WAIT_SEC)
-                            if skip_clicks % 20 == 0:
-                                print(f"  Gap recovery: {skip_clicks} skips so far, next still-missing part is {next_expected_part()} (filling up to {landed - 1})")
+                                tape_w = player_frame.locator('.seekometer-tape').first.evaluate("el => el.getBoundingClientRect().width")
+                                hi = float(tape_w)
+                            except Exception as e:
+                                print(f"  [tape-seek] could not read tape width ({e})")
+                        seek_ok = lo is not None and hi is not None and hi > lo
+                        if not seek_ok:
+                            print(f"  [seek-search] no usable tape bounds (lo={lo}, hi={hi}); falling back to 15s skips.")
+                        if seek_ok:
+                            while next_expected_part() < landed and seek_ok:
+                                target = next_expected_part()
+                                s_lo, s_hi = lo, hi
+                                probes = 0
+                                while probes < MAX_SEEK_PROBES and next_expected_part() == target:
+                                    if s_hi - s_lo < 30:  # interval down to ~15s of audio; boundary pinned
+                                        print(f"  [seek-search] interval collapsed to {s_hi - s_lo:.0f}px without capturing Part {target}.")
+                                        break
+                                    mid = (s_lo + s_hi) / 2.0
+                                    seq_before = _trigger_seq
+                                    landed_px = seek_tape_to_px(page, player_frame, mid)
+                                    if landed_px is None:
+                                        print("  [seek-search] tape drag failed; falling back to 15s skips.")
+                                        seek_ok = False
+                                        break
+                                    probes += 1
+                                    # Wait for a FRESH trigger from this seek before classifying
+                                    # the probe - a fixed short sleep can read a stale part number
+                                    # and misclassify. Seeks within the already-loaded part fire
+                                    # no new trigger, so on timeout the stale value IS correct.
+                                    probe_deadline = time.time() + SEEK_TRIGGER_TIMEOUT_SEC
+                                    while time.time() < probe_deadline and _trigger_seq == seq_before:
+                                        time.sleep(0.25)
+                                    fresh = _trigger_seq != seq_before
+                                    if fresh:
+                                        # Scrubbing fires triggers for parts merely passed over.
+                                        # Wait for the stream to go quiet (2s) so we read the
+                                        # trigger belonging to the tape's resting position.
+                                        last_seq = _trigger_seq
+                                        quiet_since = time.time()
+                                        settle_deadline = time.time() + 8
+                                        while time.time() < settle_deadline and (time.time() - quiet_since) < 2.0:
+                                            time.sleep(0.25)
+                                            if _trigger_seq != last_seq:
+                                                last_seq = _trigger_seq
+                                                quiet_since = time.time()
+                                    cur = _last_seen_part
+                                    # Classify against where the tape actually SETTLED, not the
+                                    # requested midpoint - drags aren't pixel-accurate and the
+                                    # tape can drift after release; narrowing by the wrong
+                                    # coordinate corrupts the interval.
+                                    settled_px = tape_position_px(player_frame)
+                                    if settled_px is None:
+                                        settled_px = landed_px
+                                    print(f"  [seek-search] probe {probes}/{MAX_SEEK_PROBES}: tape_px={settled_px:.0f} (~{settled_px / TAPE_PX_PER_SEC / 60:.1f} min) -> part {cur} ({'fresh trigger' if fresh else 'no new trigger'}, target {target})")
+                                    if cur < target:
+                                        s_lo = max(s_lo, settled_px)
+                                    elif cur > target:
+                                        s_hi = min(s_hi, settled_px)
+                                if not seek_ok:
+                                    break
+                                if next_expected_part() == target:
+                                    print(f"  Seek search could not trigger Part {target} in {probes} probes; falling back to 15s skips.")
+                                    break
+                                print(f"  Seek search captured Part {target} in {probes} probes.")
+                                lo = tape_position_px(player_frame) or lo  # continue from here for the next missing part
+
+                        # Fallback when no slider was found or the search stalled: play
+                        # through the chapter in 15s steps, budgeted from the chapter length
+                        # in the Next Chapter label ("Next Chapter . 88 minutes ahead.").
                         if next_expected_part() < landed:
-                            print(f"  Gap recovery gave up after {skip_clicks} skips; Part {next_expected_part()} still missing (Step 4 will retry).")
+                            skip_budget = MAX_GAP_SKIP_CLICKS
+                            try:
+                                label = player_frame.locator('button[aria-label*="Next Chapter"]').first.get_attribute('aria-label') or ""
+                                hours_m = re.search(r'(\d+)\s*hour', label)
+                                minutes_m = re.search(r'(\d+)\s*minute', label)
+                                total_min = (int(hours_m.group(1)) * 60 if hours_m else 0) + (int(minutes_m.group(1)) if minutes_m else 0)
+                                if total_min:
+                                    skip_budget = max(skip_budget, (total_min * 60) // 15 + 20)
+                                    print(f"  Chapter ahead is ~{total_min} min of audio; skip budget set to {skip_budget}.")
+                            except Exception as e:
+                                print(f"  Could not read chapter length for skip budget ({e}); using default {skip_budget}.")
+
+                            skip_btn = player_frame.locator('button[aria-label*="Advance 15 seconds"], button.mini-player-jump-ahead')
+                            skip_clicks = 0
+                            while next_expected_part() < landed and skip_clicks < skip_budget:
+                                try:
+                                    skip_btn.first.click(timeout=3000)
+                                except (PlaywrightTimeoutError, Exception) as e:
+                                    print(f"  15s advance failed during gap recovery: {e}")
+                                    break
+                                skip_clicks += 1
+                                time.sleep(GAP_SKIP_WAIT_SEC)
+                                if skip_clicks % 20 == 0:
+                                    print(f"  Gap recovery: {skip_clicks}/{skip_budget} skips so far, next still-missing part is {next_expected_part()} (filling up to {landed - 1})")
+
+                        if next_expected_part() < landed:
+                            print(f"  Gap recovery gave up; Part {next_expected_part()} still missing (Step 4 will retry).")
                         else:
-                            print(f"  Gap recovery done after {skip_clicks} 15s skips; parts up to {landed - 1} captured. Resuming chapter skips to reach Part {landed}.")
+                            print(f"  Gap recovery done; parts up to {landed - 1} captured. Resuming chapter skips to reach Part {landed}.")
 
                         # An accepted trigger only marks the part; the browser's CDN audio
                         # fetch is still in flight. Clicking Next Chapter now can abort that
@@ -865,7 +1116,7 @@ def run():
                     no_new_parts_count = 0 # Reset counter if new parts were found
 
             print(f"Forward pass complete. Total unique parts found: {len(downloaded_parts)}")
-            print(f"Highest part number found: {max_part_number_found}")
+            print(f"Highest part number downloaded: {max_part_number_found}; highest part number seen in any trigger: {max_part_number_seen}")
 
             # --- Wait for all active downloads to complete before proceeding ---
             print("Waiting for all active downloads to complete...")
@@ -880,8 +1131,13 @@ def run():
 
             # --- Step 4: Retrieve Missing Parts via Signed URL Extraction ---
             print("Checking for any missing parts and attempting to retrieve them...")
+            # Range over the highest part SEEN, not just downloaded: parts skipped by
+            # chapter jumps were never accepted, so max_part_number_found alone would
+            # undercount and silently declare success with parts missing (e.g. a run
+            # that downloaded 1-8 but saw triggers for 11 is missing 9-11, not "done").
+            highest_known_part = max(max_part_number_found, max_part_number_seen)
             missing_parts = []
-            for i in range(1, max_part_number_found + 1):
+            for i in range(1, highest_known_part + 1):
                 if i not in downloaded_parts:
                     missing_parts.append(i)
 
@@ -907,7 +1163,7 @@ def run():
                         break
 
                 # Try to extract all signed spine URLs from the player's JavaScript
-                if player_frame_obj and len(_signed_spine_urls) < max_part_number_found:
+                if player_frame_obj and len(_signed_spine_urls) < highest_known_part:
                     print("Extracting signed spine URLs from player...")
                     try:
                         spine_data = player_frame_obj.evaluate(r"""
@@ -1032,4 +1288,13 @@ def run():
 
 # --- How to Run ---
 if __name__ == "__main__":
-    run()
+    with open(RUN_LOG_FILE, 'w') as _log:
+        _log_file = _log
+        sys.stdout = _Tee(sys.__stdout__, _log)
+        sys.stderr = _Tee(sys.__stderr__, _log)
+        try:
+            run()
+        finally:
+            sys.stdout = sys.__stdout__
+            sys.stderr = sys.__stderr__
+            _log_file = None

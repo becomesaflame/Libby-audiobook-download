@@ -1,4 +1,7 @@
 libby_config.json
+libby_run.log
+logs/
+snapshots/
 Libby_Audiobook_Downloads/
 __pycache__/
 *.pyc
