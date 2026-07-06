@@ -875,6 +875,16 @@ def run():
             else:
                 print(f"Missing parts identified: {sorted(missing_parts)}")
 
+                # These parts' triggers were accepted during the forward pass, but the
+                # audio download never completed. The order gate in handle_request keys
+                # on found_parts, so unless we evict them it would reject every re-trigger
+                # as out-of-order (expecting a part past the end of the book) and the
+                # retries below could never succeed.
+                with active_downloads_lock:
+                    for p in missing_parts:
+                        found_parts.discard(p)
+                    _latest_libby_part_number_trigger = None
+
                 player_frame_obj = None
                 for frame in page.frames:
                     if 'listen.libbyapp.com' in frame.url:
