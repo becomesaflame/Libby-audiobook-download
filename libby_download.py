@@ -678,7 +678,7 @@ def run():
             # Recording is gated to strict ascending order (see handle_request), so the
             # resume position that loaded above was ignored; Part 1 will be the first part
             # accepted once the rewind navigation triggers it.
-            global downloads_enabled
+            global downloads_enabled, _latest_libby_part_number_trigger
             try:
                 player_frame_init = page.frame_locator('iframe[src*="listen.libbyapp.com"]')
                 prev_btn = player_frame_init.locator('button[aria-label*="Previous Chapter"]')
@@ -839,6 +839,21 @@ def run():
                             print(f"  Gap recovery gave up after {skip_clicks} skips; Part {next_expected_part()} still missing (Step 4 will retry).")
                         else:
                             print(f"  Gap recovery done after {skip_clicks} 15s skips; parts up to {landed - 1} captured. Resuming chapter skips to reach Part {landed}.")
+
+                        # An accepted trigger only marks the part; the browser's CDN audio
+                        # fetch is still in flight. Clicking Next Chapter now can abort that
+                        # fetch ("No Playwright response object"), losing the part until the
+                        # Step 4 retry. Let pending downloads settle before navigating away.
+                        pending = []
+                        wait_deadline = time.time() + 20
+                        while time.time() < wait_deadline:
+                            with active_downloads_lock:
+                                pending = sorted(p for p in found_parts if p not in downloaded_parts)
+                            if not pending:
+                                break
+                            time.sleep(1)
+                        if pending:
+                            print(f"  Warning: recovered part(s) {pending} still not downloaded after 20s; Step 4 will retry them.")
 
                 if len(downloaded_parts) == current_parts_count:
                     no_new_parts_count += 1
@@ -1012,8 +1027,7 @@ def run():
         finally:
             if browser:
                 print("Closing browser...")
-                # browser.close()
-                breakpoint()
+                browser.close()
             print("Script finished.")
 
 # --- How to Run ---
