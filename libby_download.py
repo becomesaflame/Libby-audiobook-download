@@ -220,6 +220,62 @@ def save_config(config_data):
         json.dump(config_data, f, indent=4)
     print(f"Saved configuration to {CONFIG_FILE}.")
 
+def collect_shelf_titles(page, format_class):
+    """Return (titles, authors) for shelf tiles of the given Libby format class."""
+    tiles = page.locator(f'.title-list-tiles .title-tile.{format_class}').all()
+    titles = []
+    authors = []
+    for tile in tiles:
+        title_element = tile.locator('.title-tile-title').first
+        if title_element:
+            titles.append(normalize_text(title_element.text_content()))
+
+        author_text = ""
+        for author_selector in ['.title-tile-author', '.title-tile-creator', '.title-tile-subtitle']:
+            try:
+                author_element = tile.locator(author_selector).first
+                if author_element and author_element.is_visible():
+                    candidate = normalize_text(author_element.text_content())
+                    if candidate:
+                        author_text = candidate
+                        break
+            except Exception:
+                continue
+        authors.append(author_text)
+    return titles, authors
+
+
+def title_matches(requested, candidate):
+    """Case-insensitive substring match between a requested title and a shelf title."""
+    if not requested or not candidate:
+        return False
+    req = requested.lower()
+    cand = candidate.lower()
+    return req in cand or cand in req
+
+
+def explain_missing_audiobook(page, requested_title):
+    """If the user asked for a title that is on loan as an ebook, say so plainly."""
+    ebook_titles, _ = collect_shelf_titles(page, 'data-title-tile-format_book')
+    for ebook_title in ebook_titles:
+        if title_matches(requested_title, ebook_title):
+            print(f"\nCannot download '{requested_title}': that title is on your shelf as an ebook, not an audiobook.")
+            print("This script only downloads audiobooks (MP3 parts from the Libby player).")
+            print("In Libby, search for the title again and borrow the audiobook edition (headphones icon),")
+            print("then re-run this script once it appears on your shelf with 'Open Audiobook'.")
+            return True
+    print(f"\n'{requested_title}' was not found as an audiobook on your shelf.")
+    print("Make sure you've borrowed the audiobook edition and it shows 'Open Audiobook' in Libby.")
+    return False
+
+
+def normalize_text(text):
+    """Collapse Libby's non-breaking spaces and HTML entities into normal spaces."""
+    if not text:
+        return ""
+    return text.replace('\xa0', ' ').replace('&nbsp;', ' ').strip()
+
+
 def sanitize_filename(name):
     """Remove or replace characters that are invalid in directory/file names."""
     sanitized = re.sub(r'[<>:"/\\|?*]', '_', name)
@@ -720,53 +776,50 @@ def run():
             print("\nAudiobooks on your Shelf:")
             save_snapshot(page, "shelf")
             try:
-                # Wait for audiobook tiles to be visible
+                # Only audiobook tiles can be opened in the Libby player. Ebook loans use
+                # "Read With..." and are listed separately so users know why a title is missing.
                 page.wait_for_selector('.title-list-tiles .title-tile', timeout=15000)
 
-                audiobook_tiles = page.locator('.title-list-tiles .title-tile').all()
-                audiobook_titles = []
-                audiobook_authors = []
-                for i, tile in enumerate(audiobook_tiles):
-                    title_element = tile.locator('.title-tile-title').first
-                    if title_element:
-                        title_text = title_element.text_content().strip().replace('&nbsp;', ' ')
-                        audiobook_titles.append(title_text)
-
-                    author_text = ""
-                    for author_selector in ['.title-tile-author', '.title-tile-creator', '.title-tile-subtitle']:
-                        try:
-                            author_element = tile.locator(author_selector).first
-                            if author_element and author_element.is_visible():
-                                candidate = author_element.text_content().strip().replace('&nbsp;', ' ')
-                                if candidate:
-                                    author_text = candidate
-                                    break
-                        except Exception:
-                            continue
-                    audiobook_authors.append(author_text)
+                audiobook_titles, audiobook_authors = collect_shelf_titles(page, 'data-title-tile-format_audiobook')
+                ebook_titles, _ = collect_shelf_titles(page, 'data-title-tile-format_book')
 
                 print(f"DEBUG: Parsed Audiobook Titles: {audiobook_titles}")
                 print(f"DEBUG: Parsed Audiobook Authors: {audiobook_authors}")
+                if ebook_titles:
+                    print(f"DEBUG: Ebook-only loans on shelf (not downloadable here): {ebook_titles}")
 
                 if not audiobook_titles:
                     print("No audiobooks found on your shelf.")
+                    preselect_title = normalize_text(os.environ.get('LIBBY_BOOK_TITLE', ''))
+                    if preselect_title:
+                        explain_missing_audiobook(page, preselect_title)
+                    elif ebook_titles:
+                        print("\nYou do have ebook loans on your shelf, but this script only downloads audiobooks:")
+                        for title in ebook_titles:
+                            print(f"  - {title} (ebook)")
                     return
 
-                # Prompt user for which book on their shelf they want to download.
-                # Print numbered list for user selection
+                # Prompt user for which audiobook on their shelf they want to download.
                 for i, title in enumerate(audiobook_titles):
                     print(f"{i+1}. {title}")
+                if ebook_titles:
+                    print("\nEbook loans on your shelf (not supported by this script):")
+                    for title in ebook_titles:
+                        print(f"  - {title}")
 
                 # Non-interactive preselect by title (for unattended/testing runs):
                 # LIBBY_BOOK_TITLE=Wicked picks the first shelf title containing the
                 # string, case-insensitively. Shelf order is not stable, so piping a
                 # number into stdin can select the wrong book.
-                preselect_title = os.environ.get('LIBBY_BOOK_TITLE', '').strip()
-                preselect_matches = [i for i, t in enumerate(audiobook_titles) if preselect_title and preselect_title.lower() in t.lower()]
+                preselect_title = normalize_text(os.environ.get('LIBBY_BOOK_TITLE', ''))
+                preselect_matches = [i for i, t in enumerate(audiobook_titles) if preselect_title and title_matches(preselect_title, t)]
                 if preselect_matches:
                     choice_index = preselect_matches[0]
                     selected_title = audiobook_titles[choice_index]
                     print(f"Preselected via LIBBY_BOOK_TITLE={preselect_title!r}: '{selected_title}'")
+                elif preselect_title:
+                    explain_missing_audiobook(page, preselect_title)
+                    return
                 # Select audiobook (auto-select only when there's a single option)
                 elif AUTO_SELECT_FIRST_AUDIOBOOK and len(audiobook_titles) == 1:
                     choice_index = 0
@@ -802,19 +855,21 @@ def run():
                 print(f"Download directory for this book: {book_download_dir}")
                 config['DOWNLOAD_DIRECTORY'] = book_download_dir
 
-                # Locate the specific audiobook tile using the selected title
-                audiobook_tile_locator = page.locator(f"""div.title-tile:has-text("{selected_title}")""").first
-                # Click the "Open Audiobook" button within that tile
+                # Open the tile the user picked by index - not by title text. Libby titles
+                # often contain non-breaking spaces that break :has-text() matching.
                 open_audiobook_button_selector = """button[role="button"]:has-text("Open Audiobook")"""
-                audiobook_tile_locator.locator(open_audiobook_button_selector).click()
-                page.wait_for_load_state('networkidle')
+                page.locator('.title-list-tiles .title-tile.data-title-tile-format_audiobook').nth(choice_index).locator(open_audiobook_button_selector).click(timeout=10000)
+                try:
+                    page.wait_for_load_state('networkidle', timeout=15000)
+                except PlaywrightTimeoutError:
+                    pass  # Libby's SPA often never reaches networkidle; the player still loads
                 time.sleep(3)
-                filename = f"15_after_open_audiobook_button_{selected_title.replace(' ', '_')}.png"
+                filename = f"15_after_open_audiobook_button_{book_folder_name.replace(' ', '_')}.png"
                 screenshot_path = os.path.join(config['DOWNLOAD_DIRECTORY'], filename)
                 page.screenshot(path=screenshot_path)
 
-            except PlaywrightTimeoutError:
-                print("Error: Audiobook titles did not appear in time on the shelf.")
+            except PlaywrightTimeoutError as e:
+                print(f"Error: Timed out while opening the selected audiobook on the shelf: {e}")
                 return
             except Exception as e:
                 print(f"An error occurred while listing/selecting audiobooks: {e}")
