@@ -316,6 +316,22 @@ def display_name_to_file_as(name):
     return f"{parts[-1]}, {' '.join(parts[:-1])}"
 
 
+def _best_cover_url_from_item(item):
+    """Pick the largest available cover image URL from an OverDrive media object."""
+    if not isinstance(item, dict):
+        return ''
+    covers = item.get('covers') or {}
+    if not isinstance(covers, dict):
+        return ''
+    for key in ('cover510Wide', 'cover300Wide', 'cover150Wide', 'cover'):
+        entry = covers.get(key)
+        if isinstance(entry, dict):
+            href = normalize_text(entry.get('href') or '')
+            if href:
+                return href
+    return ''
+
+
 def parse_file_as(file_as):
     """Split OverDrive fileAs into Last, Title, First, Middle name parts."""
     file_as = normalize_text(file_as)
@@ -434,6 +450,7 @@ def parse_overdrive_media_item(item, title_id=None):
         'author_file_as': author_file_as,
         'series_name': series_name,
         'series_index': series_index or '',
+        'cover_url': _best_cover_url_from_item(item),
     }
 
 
@@ -466,6 +483,50 @@ def _parse_captured_overdrive_responses(captured, title_id=None):
         elif not fallback_parsed:
             fallback_parsed = parsed
     return bulk_parsed or fallback_parsed
+
+
+def scrape_cover_from_dom(page):
+    """DOM fallback: find cover image URL on Libby title details."""
+    selectors = (
+        'img[src*="od-cdn.com"]',
+        '.title-details-cover img',
+        '.cover img',
+        '[class*="cover"] img',
+    )
+    for selector in selectors:
+        try:
+            imgs = page.locator(selector)
+            if imgs.count() > 0:
+                src = normalize_text(imgs.first.get_attribute('src') or '')
+                if src.startswith('http'):
+                    return src
+        except Exception:
+            continue
+    return ''
+
+
+def download_cover_image(cover_url, dest_dir):
+    """Download cover art into dest_dir as cover.jpg (or .png/.webp from content-type)."""
+    if not cover_url:
+        return None
+    try:
+        response = requests.get(cover_url, timeout=30)
+        response.raise_for_status()
+        content_type = (response.headers.get('content-type') or '').lower()
+        if 'png' in content_type:
+            ext = '.png'
+        elif 'webp' in content_type:
+            ext = '.webp'
+        else:
+            ext = '.jpg'
+        cover_path = os.path.join(dest_dir, f'cover{ext}')
+        with open(cover_path, 'wb') as f:
+            f.write(response.content)
+        print(f"Downloaded cover art to {cover_path}")
+        return cover_path
+    except Exception as e:
+        print(f"Cover art download failed: {e}")
+        return None
 
 
 def scrape_series_from_dom(page):
@@ -575,6 +636,7 @@ def fetch_title_metadata(page, tile, fallback_title, fallback_author='', title_i
         'author_file_as': display_name_to_file_as(fallback_author),
         'series_name': '',
         'series_index': '',
+        'cover_url': '',
     }
 
     try:
@@ -596,6 +658,7 @@ def fetch_title_metadata(page, tile, fallback_title, fallback_author='', title_i
             print("  [metadata] no OverDrive API metadata captured; trying DOM fallback.")
             dom_author, dom_file_as = scrape_authors_from_dom(page)
             dom_series, dom_index = scrape_series_from_dom(page)
+            dom_cover = scrape_cover_from_dom(page)
             if dom_author:
                 metadata['author_name'] = dom_author
                 metadata['author_file_as'] = dom_file_as
@@ -603,6 +666,8 @@ def fetch_title_metadata(page, tile, fallback_title, fallback_author='', title_i
                 metadata['series_name'] = dom_series
             if dom_index:
                 metadata['series_index'] = dom_index
+            if dom_cover:
+                metadata['cover_url'] = dom_cover
 
         print(
             f"  [metadata] author={metadata.get('author_file_as')!r} "
@@ -1205,6 +1270,7 @@ def run():
                 )
                 print(f"Download directory for this book: {book_download_dir}")
                 os.makedirs(book_download_dir, exist_ok=True)
+                download_cover_image(title_metadata.get('cover_url'), book_download_dir)
                 config['DOWNLOAD_DIRECTORY'] = book_download_dir
                 book_folder_name = os.path.basename(book_download_dir)
 

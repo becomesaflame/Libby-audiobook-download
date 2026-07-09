@@ -65,6 +65,18 @@ class TestOverdriveParser(unittest.TestCase):
         self.assertEqual(meta['author_file_as'], 'Maguire, Gregory')
         self.assertEqual(meta['series_index'], '1')
 
+    def test_cover_url_from_covers(self):
+        payload = [{
+            'id': '2943031',
+            'title': 'Wicked',
+            'covers': {
+                'cover300Wide': {'href': 'https://img.example/cover300.jpg'},
+                'cover150Wide': {'href': 'https://img.example/cover150.jpg'},
+            },
+        }]
+        meta = parse_overdrive_api_payload(payload, title_id='2943031')
+        self.assertEqual(meta['cover_url'], 'https://img.example/cover300.jpg')
+
 
 class TestBuildPath(unittest.TestCase):
     def test_series_path(self):
