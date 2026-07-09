@@ -277,11 +277,356 @@ def normalize_text(text):
 
 
 def sanitize_filename(name):
-    """Remove or replace characters that are invalid in directory/file names."""
-    sanitized = re.sub(r'[<>:"/\\|?*]', '_', name)
+    """Remove characters unsafe for paths (colons break Android MTP transfers)."""
+    if not name:
+        return ""
+    sanitized = name.replace(':', '')
+    sanitized = re.sub(r'[<>"/\\|?*]', '_', sanitized)
     sanitized = sanitized.strip().strip('.')
     sanitized = re.sub(r'[_\s]+', ' ', sanitized)
     return sanitized.strip()
+
+
+def extract_title_id_from_tile(tile):
+    """Parse Libby title ID from a shelf tile's data-title_* class."""
+    try:
+        class_attr = tile.get_attribute('class') or ''
+        match = re.search(r'data-title_(\d+)', class_attr)
+        if match:
+            return match.group(1)
+    except Exception:
+        pass
+    return None
+
+
+def _creator_is_author(role):
+    return (role or '').lower() in ('author', 'aut')
+
+
+def display_name_to_file_as(name):
+    """Best-effort 'First Last' -> 'Last, First' when OverDrive fileAs is missing."""
+    name = normalize_text(name)
+    if not name:
+        return ''
+    if ',' in name:
+        return name
+    parts = name.split()
+    if len(parts) < 2:
+        return name
+    return f"{parts[-1]}, {' '.join(parts[:-1])}"
+
+
+def parse_file_as(file_as):
+    """Split OverDrive fileAs into Last, Title, First, Middle name parts."""
+    file_as = normalize_text(file_as)
+    if not file_as:
+        return {'last': '', 'title': '', 'first': '', 'middle': ''}
+    if ',' not in file_as:
+        parts = file_as.split()
+        return {'last': parts[-1] if parts else '', 'title': '', 'first': ' '.join(parts[:-1]), 'middle': ''}
+    last, _, rest = file_as.partition(',')
+    rest = rest.strip()
+    rest_parts = rest.split() if rest else []
+    return {
+        'last': last.strip(),
+        'title': '',
+        'first': rest_parts[0] if rest_parts else '',
+        'middle': ' '.join(rest_parts[1:]) if len(rest_parts) > 1 else '',
+    }
+
+
+def _first_author_from_creators(creators):
+    """Return (display_name, file_as) for the first author in a creators list."""
+    if not creators:
+        return '', ''
+    for creator in creators:
+        if not isinstance(creator, dict):
+            continue
+        if not _creator_is_author(creator.get('role')):
+            continue
+        display = normalize_text(creator.get('name') or '')
+        file_as = normalize_text(
+            creator.get('fileAs') or creator.get('file_as') or creator.get('sortName') or ''
+        )
+        if not file_as and display:
+            file_as = display_name_to_file_as(display)
+        return display, file_as
+    return '', ''
+
+
+def _media_records_from_payload(payload):
+    """Yield media/title dicts from assorted OverDrive API response shapes."""
+    if isinstance(payload, list):
+        for item in payload:
+            if isinstance(item, dict):
+                yield item
+        return
+    if not isinstance(payload, dict):
+        return
+    for key in ('titles', 'items', 'media', 'products'):
+        value = payload.get(key)
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    yield item
+            return
+    if any(k in payload for k in ('title', 'series', 'creators', 'creator', 'readingOrder', 'detailedSeries')):
+        yield payload
+
+
+def parse_overdrive_media_item(item, title_id=None):
+    """Extract Libation-relevant metadata from one OverDrive media object."""
+    if not isinstance(item, dict):
+        return None
+
+    if title_id is not None:
+        item_ids = [
+            str(item.get('id', '')),
+            str(item.get('crossRefId', '')),
+            str(item.get('titleId', '')),
+        ]
+        if str(title_id) not in item_ids and title_id not in item_ids:
+            pass  # still try — bulk responses may use different id fields
+
+    title = normalize_text(item.get('title') or '')
+    if not title and isinstance(item.get('title'), dict):
+        title_obj = item['title']
+        title = normalize_text(title_obj.get('main') or title_obj.get('title') or '')
+
+    series_name = normalize_text(item.get('series') or '')
+    if not series_name and isinstance(item.get('series'), dict):
+        series_name = normalize_text(item['series'].get('name') or item['series'].get('title') or '')
+
+    series_index = item.get('readingOrder') or item.get('seriesIndex') or item.get('sequence')
+    detailed_series = item.get('detailedSeries')
+    if isinstance(detailed_series, dict):
+        if not series_name:
+            series_name = normalize_text(detailed_series.get('seriesName') or detailed_series.get('name') or '')
+        if not series_index:
+            series_index = detailed_series.get('readingOrder') or detailed_series.get('rank')
+    if series_index is not None:
+        series_index = normalize_text(str(series_index))
+
+    creators = item.get('creators') or item.get('creator') or []
+    if isinstance(creators, dict):
+        creators = [creators]
+    author_name, author_file_as = _first_author_from_creators(creators)
+
+    if not author_name and isinstance(item.get('primaryCreator'), dict):
+        pc = item['primaryCreator']
+        if _creator_is_author(pc.get('role')):
+            author_name = normalize_text(pc.get('name') or '')
+            author_file_as = normalize_text(
+                pc.get('fileAs') or pc.get('sortName') or ''
+            ) or display_name_to_file_as(author_name)
+
+    if not author_file_as:
+        author_file_as = normalize_text(
+            item.get('firstCreatorSortName') or ''
+        ) or display_name_to_file_as(author_name)
+
+    if not title and not author_name and not series_name:
+        return None
+
+    return {
+        'title': title,
+        'author_name': author_name,
+        'author_file_as': author_file_as,
+        'series_name': series_name,
+        'series_index': series_index or '',
+    }
+
+
+def parse_overdrive_api_payload(payload, title_id=None):
+    """Parse the best matching media record from an OverDrive JSON response."""
+    best = None
+    for item in _media_records_from_payload(payload):
+        parsed = parse_overdrive_media_item(item, title_id=title_id)
+        if not parsed:
+            continue
+        if title_id is not None:
+            item_ids = {str(item.get('id', '')), str(item.get('crossRefId', '')), str(item.get('titleId', ''))}
+            if str(title_id) in item_ids:
+                return parsed
+        best = best or parsed
+    return best
+
+
+def _parse_captured_overdrive_responses(captured, title_id=None):
+    """Pick the richest metadata record from captured API responses."""
+    bulk_parsed = None
+    fallback_parsed = None
+    for url, payload in captured:
+        parsed = parse_overdrive_api_payload(payload, title_id=title_id)
+        if not parsed:
+            continue
+        if '/media/bulk' in url:
+            if title_id is None or parsed.get('title'):
+                bulk_parsed = parsed
+        elif not fallback_parsed:
+            fallback_parsed = parsed
+    return bulk_parsed or fallback_parsed
+
+
+def scrape_series_from_dom(page):
+    """DOM fallback: read series block on Libby title details if API data is missing."""
+    series_name = ''
+    series_index = ''
+    try:
+        series_heading = page.locator('h2, h3').filter(has_text=re.compile(r'^Series$', re.I))
+        if series_heading.count() > 0:
+            block = series_heading.first.locator('xpath=ancestor::div[contains(@class,"block") or contains(@class,"strap")][1]')
+            if block.count() == 0:
+                block = series_heading.first.locator('xpath=..')
+            text = normalize_text(block.first.inner_text())
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            for line in lines:
+                if line.lower() == 'series':
+                    continue
+                num_match = re.match(r'^#?(\d+(?:\.\d+)?)\s+(.+)$', line)
+                if num_match and ('★' in line or '☆' in line or '*' in line):
+                    series_index = num_match.group(1)
+                    series_name = normalize_text(num_match.group(2).replace('★', '').replace('☆', '').replace('*', ''))
+                    break
+                if not series_name and line.lower() != 'series':
+                    series_name = line
+    except Exception as e:
+        print(f"  [metadata] DOM series scrape failed: {e}")
+    return series_name, series_index
+
+
+def scrape_authors_from_dom(page):
+    """DOM fallback: first linked author name on title details."""
+    for selector in (
+        '.title-details-author a',
+        '.biblio-author a',
+        '.title-tile-author a',
+        '[class*="author"] a',
+    ):
+        try:
+            links = page.locator(selector)
+            if links.count() > 0:
+                name = normalize_text(links.first.text_content())
+                if name:
+                    return name, display_name_to_file_as(name)
+        except Exception:
+            continue
+    return '', ''
+
+
+def build_book_download_dir(base_dir, metadata, fallback_title, fallback_author=''):
+    """Libation-style path: {fileAs}/{series}/{n}_{title}/ or {fileAs}/{title}/."""
+    title = sanitize_filename(metadata.get('title') or fallback_title)
+    author_folder = sanitize_filename(
+        metadata.get('author_file_as') or display_name_to_file_as(metadata.get('author_name') or '')
+        or fallback_author
+    )
+
+    series_name = sanitize_filename(metadata.get('series_name') or '')
+    series_index = sanitize_filename(metadata.get('series_index') or '')
+
+    if series_name:
+        if series_index:
+            book_folder = (
+                f"{sanitize_filename(series_index)}_"
+                f"{sanitize_filename(metadata.get('title') or fallback_title)}"
+            )
+        else:
+            book_folder = title
+        parts = [base_dir]
+        if author_folder:
+            parts.append(author_folder)
+        parts.extend([series_name, book_folder])
+    else:
+        parts = [base_dir]
+        if author_folder:
+            parts.append(author_folder)
+        parts.append(title)
+
+    return os.path.join(*parts)
+
+
+def fetch_title_metadata(page, tile, fallback_title, fallback_author='', title_id=None):
+    """Open title details, capture OverDrive API metadata, return to shelf."""
+    if title_id is None:
+        title_id = extract_title_id_from_tile(tile)
+
+    captured = []
+
+    def on_response(response):
+        url = response.url
+        if response.status != 200:
+            return
+        if 'overdrive.com' not in url:
+            return
+        if not any(token in url for token in ('media', 'titles', 'products', 'bulk')):
+            return
+        try:
+            payload = response.json()
+        except Exception:
+            return
+        captured.append((url, payload))
+        log_only(f"  [metadata] captured API response: {url}")
+
+    page.on('response', on_response)
+    metadata = {
+        'title': fallback_title,
+        'author_name': fallback_author,
+        'author_file_as': display_name_to_file_as(fallback_author),
+        'series_name': '',
+        'series_index': '',
+    }
+
+    try:
+        title_link = tile.locator('a.title-tile-action').first
+        print(f"Opening title details for metadata (title id={title_id})...")
+        title_link.click(timeout=10000)
+        try:
+            page.wait_for_load_state('networkidle', timeout=15000)
+        except PlaywrightTimeoutError:
+            pass
+        time.sleep(2)
+        save_snapshot(page, 'title_details')
+
+        parsed = _parse_captured_overdrive_responses(captured, title_id=title_id)
+        if parsed:
+            print("  [metadata] parsed from OverDrive API")
+            metadata.update({k: v for k, v in parsed.items() if v})
+        else:
+            print("  [metadata] no OverDrive API metadata captured; trying DOM fallback.")
+            dom_author, dom_file_as = scrape_authors_from_dom(page)
+            dom_series, dom_index = scrape_series_from_dom(page)
+            if dom_author:
+                metadata['author_name'] = dom_author
+                metadata['author_file_as'] = dom_file_as
+            if dom_series:
+                metadata['series_name'] = dom_series
+            if dom_index:
+                metadata['series_index'] = dom_index
+
+        print(
+            f"  [metadata] author={metadata.get('author_file_as')!r} "
+            f"series={metadata.get('series_name')!r} index={metadata.get('series_index')!r}"
+        )
+    except Exception as e:
+        print(f"  [metadata] title details fetch failed ({e}); using shelf fallbacks.")
+    finally:
+        try:
+            page.remove_listener('response', on_response)
+        except Exception:
+            pass
+        try:
+            page.go_back()
+            try:
+                page.wait_for_load_state('networkidle', timeout=15000)
+            except PlaywrightTimeoutError:
+                pass
+            time.sleep(2)
+            page.wait_for_selector('.title-list-tiles .title-tile', timeout=15000)
+        except Exception as e:
+            print(f"  [metadata] warning: could not return to shelf cleanly: {e}")
+
+    return metadata
 
 # --- Network Request Handler ---
 def handle_request(request):
@@ -840,25 +1185,33 @@ def run():
                         except ValueError:
                             print("Invalid input. Please enter a number.")
 
-                # Create a book-specific download subdirectory (Author/Title or just Title)
+                # Fetch series/author metadata from title details before opening the player.
+                selected_tile = page.locator(
+                    '.title-list-tiles .title-tile.data-title-tile-format_audiobook'
+                ).nth(choice_index)
                 selected_author = audiobook_authors[choice_index] if choice_index < len(audiobook_authors) else ""
-                book_folder_name = sanitize_filename(selected_title)
-                if selected_author:
-                    author_folder_name = sanitize_filename(selected_author)
-                    book_download_dir = os.path.join(config['DOWNLOAD_DIRECTORY'], author_folder_name, book_folder_name)
-                    print(f"Author: '{selected_author}' -> folder: '{author_folder_name}'")
-                else:
-                    book_download_dir = os.path.join(config['DOWNLOAD_DIRECTORY'], book_folder_name)
-                    print("No author info found on shelf tile; using title-only folder.")
+                title_metadata = fetch_title_metadata(
+                    page,
+                    selected_tile,
+                    fallback_title=selected_title,
+                    fallback_author=selected_author,
+                )
 
-                os.makedirs(book_download_dir, exist_ok=True)
+                book_download_dir = build_book_download_dir(
+                    config['DOWNLOAD_DIRECTORY'],
+                    title_metadata,
+                    fallback_title=selected_title,
+                    fallback_author=selected_author,
+                )
                 print(f"Download directory for this book: {book_download_dir}")
+                os.makedirs(book_download_dir, exist_ok=True)
                 config['DOWNLOAD_DIRECTORY'] = book_download_dir
+                book_folder_name = os.path.basename(book_download_dir)
 
                 # Open the tile the user picked by index - not by title text. Libby titles
                 # often contain non-breaking spaces that break :has-text() matching.
                 open_audiobook_button_selector = """button[role="button"]:has-text("Open Audiobook")"""
-                page.locator('.title-list-tiles .title-tile.data-title-tile-format_audiobook').nth(choice_index).locator(open_audiobook_button_selector).click(timeout=10000)
+                selected_tile.locator(open_audiobook_button_selector).click(timeout=10000)
                 try:
                     page.wait_for_load_state('networkidle', timeout=15000)
                 except PlaywrightTimeoutError:
