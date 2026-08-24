@@ -47,6 +47,10 @@ def log_only(msg):
 # --- Testing Configuration ---
 AUTO_SELECT_FIRST_AUDIOBOOK = True  # Set to False for manual selection
 
+# Playwright action/navigation timeout. Raise this on slow connections; short
+# intentional probe timeouts (chapter buttons, optional Next) stay hardcoded.
+PLAYWRIGHT_TIMEOUT_MS = 15000
+
 # --- Global Variables for Tracking Download Progress ---
 downloaded_parts = set()
 found_parts = set()  # Parts detected as soon as Libby triggers (updates before download completes)
@@ -642,9 +646,9 @@ def fetch_title_metadata(page, tile, fallback_title, fallback_author='', title_i
     try:
         title_link = tile.locator('a.title-tile-action').first
         print(f"Opening title details for metadata (title id={title_id})...")
-        title_link.click(timeout=10000)
+        title_link.click(timeout=PLAYWRIGHT_TIMEOUT_MS)
         try:
-            page.wait_for_load_state('networkidle', timeout=15000)
+            page.wait_for_load_state('networkidle', timeout=PLAYWRIGHT_TIMEOUT_MS)
         except PlaywrightTimeoutError:
             pass
         time.sleep(2)
@@ -683,11 +687,11 @@ def fetch_title_metadata(page, tile, fallback_title, fallback_author='', title_i
         try:
             page.go_back()
             try:
-                page.wait_for_load_state('networkidle', timeout=15000)
+                page.wait_for_load_state('networkidle', timeout=PLAYWRIGHT_TIMEOUT_MS)
             except PlaywrightTimeoutError:
                 pass
             time.sleep(2)
-            page.wait_for_selector('.title-list-tiles .title-tile', timeout=15000)
+            page.wait_for_selector('.title-list-tiles .title-tile', timeout=PLAYWRIGHT_TIMEOUT_MS)
         except Exception as e:
             print(f"  [metadata] warning: could not return to shelf cleanly: {e}")
 
@@ -888,6 +892,8 @@ def run():
 
             browser = p.chromium.launch(**launch_args)
             page = browser.new_page()
+            page.set_default_timeout(PLAYWRIGHT_TIMEOUT_MS)
+            page.set_default_navigation_timeout(PLAYWRIGHT_TIMEOUT_MS)
 
             # Attach the request handler
             page.on("request", handle_request)
@@ -947,7 +953,7 @@ def run():
             try:
                 # Wait for search results to appear.
                 # The HTML shows button.library-autocomplete-result elements.
-                page.wait_for_selector('button.library-autocomplete-result', timeout=15000)
+                page.wait_for_selector('button.library-autocomplete-result', timeout=PLAYWRIGHT_TIMEOUT_MS)
 
                 library_result_elements = page.locator('button.library-autocomplete-result').all()
                 library_names = []
@@ -1029,7 +1035,7 @@ def run():
             print("\nHandling 'Where do you use your library card?' option...")
             try:
                 # Wait for the options to be visible
-                page.wait_for_selector('.auth-ils-list button', timeout=10000)
+                page.wait_for_selector('.auth-ils-list button', timeout=PLAYWRIGHT_TIMEOUT_MS)
 
                 # Get all library choice buttons
                 library_choice_buttons = page.locator('.auth-ils-list button').all()
@@ -1070,9 +1076,9 @@ def run():
                     print(f"Using saved library card usage option: {options_text[config['LIBRARY_CARD_USAGE_OPTION_INDEX']]}")
 
                 # Click the corresponding button based on the stored/selected index
-                option_buttons[config['LIBRARY_CARD_USAGE_OPTION_INDEX']].click(timeout=10000)
+                option_buttons[config['LIBRARY_CARD_USAGE_OPTION_INDEX']].click(timeout=PLAYWRIGHT_TIMEOUT_MS)
                 try:
-                    page.wait_for_load_state('networkidle', timeout=15000)
+                    page.wait_for_load_state('networkidle', timeout=PLAYWRIGHT_TIMEOUT_MS)
                 except PlaywrightTimeoutError:
                     print("Note: network did not go idle after selecting card usage option; continuing anyway.")
                 time.sleep(3)
@@ -1161,7 +1167,7 @@ def run():
                 print(f"An unexpected error occurred clicking post-login 'Next': {e}")
 
 
-            page.wait_for_load_state('networkidle', timeout=60000) # Give more time for login redirect
+            page.wait_for_load_state('networkidle', timeout=PLAYWRIGHT_TIMEOUT_MS)
             print("Login attempt complete. Checking if logged in...")
             screenshot_path = os.path.join(config['DOWNLOAD_DIRECTORY'], "13_after_login_complete.png")
             page.screenshot(path=screenshot_path)
@@ -1188,7 +1194,7 @@ def run():
             try:
                 # Only audiobook tiles can be opened in the Libby player. Ebook loans use
                 # "Read With..." and are listed separately so users know why a title is missing.
-                page.wait_for_selector('.title-list-tiles .title-tile', timeout=15000)
+                page.wait_for_selector('.title-list-tiles .title-tile', timeout=PLAYWRIGHT_TIMEOUT_MS)
 
                 audiobook_titles, audiobook_authors = collect_shelf_titles(page, 'data-title-tile-format_audiobook')
                 ebook_titles, _ = collect_shelf_titles(page, 'data-title-tile-format_book')
@@ -1277,9 +1283,9 @@ def run():
                 # Open the tile the user picked by index - not by title text. Libby titles
                 # often contain non-breaking spaces that break :has-text() matching.
                 open_audiobook_button_selector = """button[role="button"]:has-text("Open Audiobook")"""
-                selected_tile.locator(open_audiobook_button_selector).click(timeout=10000)
+                selected_tile.locator(open_audiobook_button_selector).click(timeout=PLAYWRIGHT_TIMEOUT_MS)
                 try:
-                    page.wait_for_load_state('networkidle', timeout=15000)
+                    page.wait_for_load_state('networkidle', timeout=PLAYWRIGHT_TIMEOUT_MS)
                 except PlaywrightTimeoutError:
                     pass  # Libby's SPA often never reaches networkidle; the player still loads
                 time.sleep(3)
@@ -1313,7 +1319,7 @@ def run():
                 # is hidden at the very start - so waiting on Previous Chapter would stall for
                 # the full timeout whenever the book opens at/near the beginning.
                 try:
-                    player_frame_init.locator('button[aria-label*="Next Chapter"]').first.wait_for(state='visible', timeout=60000)
+                    player_frame_init.locator('button[aria-label*="Next Chapter"]').first.wait_for(state='visible', timeout=PLAYWRIGHT_TIMEOUT_MS)
                 except PlaywrightTimeoutError:
                     print("Warning: player controls did not become visible within 60s; rewind may fail.")
 
@@ -1748,6 +1754,14 @@ def run():
                         print(f"  All parts successfully retrieved!")
 
             print("All download attempts complete.")
+
+            downloaded_files = sorted(
+                f for f in os.listdir(book_download_dir)
+                if f.lower().endswith('.mp3')
+            )
+            title_display = title_metadata.get('title') or selected_title
+            author_display = title_metadata.get('author_name') or selected_author
+            print(f"\nDownloaded \"{title_display}\" by {author_display} ({len(downloaded_files)} parts) to: {book_download_dir}")
 
         except PlaywrightTimeoutError as e:
             print(f"Playwright operation timed out: {e}. This often means a selector was not found or a page took too long to load.")
