@@ -249,6 +249,53 @@ def collect_shelf_titles(page, format_class):
     return titles, authors
 
 
+def collect_shelf_audiobook_loans(page):
+    """Return (titles, authors) for borrowed audiobook loans (not holds)."""
+    return collect_shelf_titles(
+        page, 'data-tile-class_loan.data-title-tile-format_audiobook'
+    )
+
+
+def collect_shelf_audiobook_holds(page):
+    """Return (titles, authors) for audiobook holds, including ready-to-borrow."""
+    return collect_shelf_titles(
+        page, 'data-tile-class_hold.data-title-tile-format_audiobook'
+    )
+
+
+def tile_is_hold(tile):
+    """True when the shelf tile is a hold rather than an active loan."""
+    try:
+        class_attr = tile.get_attribute('class') or ''
+        return 'data-tile-class_hold' in class_attr.split()
+    except Exception:
+        return False
+
+
+def hold_status_from_tile(tile):
+    """Best-effort hold status line from a shelf tile (e.g. 'Ready to borrow!')."""
+    for selector in ['.shelf-whisperer span[role="text"]', '.wait-list-summary', '.title-status']:
+        try:
+            element = tile.locator(selector).first
+            if element.is_visible():
+                text = normalize_text(element.text_content())
+                if text:
+                    return text
+        except Exception:
+            continue
+    return ''
+
+
+def explain_hold_not_borrowed(title, hold_status=''):
+    """Tell the user their audiobook hold must be borrowed before download."""
+    print(f"\nCannot download '{title}': it is on your holds shelf, not borrowed yet.")
+    if hold_status:
+        print(f"Libby status: {hold_status}")
+    print("Borrow it in Libby first (tap 'Borrow' on the shelf or in title details),")
+    print("then re-run this script once the tile shows 'Open Audiobook'.")
+    return True
+
+
 def title_matches(requested, candidate):
     """Case-insensitive substring match between a requested title and a shelf title."""
     if not requested or not candidate:
@@ -260,6 +307,20 @@ def title_matches(requested, candidate):
 
 def explain_missing_audiobook(page, requested_title):
     """If the user asked for a title that is on loan as an ebook, say so plainly."""
+    hold_titles, _ = collect_shelf_audiobook_holds(page)
+    for hold_title in hold_titles:
+        if title_matches(requested_title, hold_title):
+            hold_tiles = page.locator(
+                '.title-list-tiles .title-tile.data-tile-class_hold.data-title-tile-format_audiobook'
+            ).all()
+            hold_status = ''
+            for tile in hold_tiles:
+                title_element = tile.locator('.title-tile-title').first
+                if title_element and title_matches(requested_title, normalize_text(title_element.text_content())):
+                    hold_status = hold_status_from_tile(tile)
+                    break
+            return explain_hold_not_borrowed(requested_title, hold_status)
+
     ebook_titles, _ = collect_shelf_titles(page, 'data-title-tile-format_book')
     for ebook_title in ebook_titles:
         if title_matches(requested_title, ebook_title):
@@ -1196,19 +1257,26 @@ def run():
                 # "Read With..." and are listed separately so users know why a title is missing.
                 page.wait_for_selector('.title-list-tiles .title-tile', timeout=PLAYWRIGHT_TIMEOUT_MS)
 
-                audiobook_titles, audiobook_authors = collect_shelf_titles(page, 'data-title-tile-format_audiobook')
+                audiobook_titles, audiobook_authors = collect_shelf_audiobook_loans(page)
+                hold_titles, _ = collect_shelf_audiobook_holds(page)
                 ebook_titles, _ = collect_shelf_titles(page, 'data-title-tile-format_book')
 
                 print(f"DEBUG: Parsed Audiobook Titles: {audiobook_titles}")
                 print(f"DEBUG: Parsed Audiobook Authors: {audiobook_authors}")
+                if hold_titles:
+                    print(f"DEBUG: Audiobook holds on shelf (borrow first, not downloadable yet): {hold_titles}")
                 if ebook_titles:
                     print(f"DEBUG: Ebook-only loans on shelf (not downloadable here): {ebook_titles}")
 
                 if not audiobook_titles:
-                    print("No audiobooks found on your shelf.")
+                    print("No borrowed audiobooks found on your shelf.")
                     preselect_title = normalize_text(os.environ.get('LIBBY_BOOK_TITLE', ''))
                     if preselect_title:
                         explain_missing_audiobook(page, preselect_title)
+                    elif hold_titles:
+                        print("\nYou do have audiobook holds, but none are borrowed yet:")
+                        for title in hold_titles:
+                            print(f"  - {title} (hold — tap Borrow in Libby first)")
                     elif ebook_titles:
                         print("\nYou do have ebook loans on your shelf, but this script only downloads audiobooks:")
                         for title in ebook_titles:
@@ -1218,6 +1286,10 @@ def run():
                 # Prompt user for which audiobook on their shelf they want to download.
                 for i, title in enumerate(audiobook_titles):
                     print(f"{i+1}. {title}")
+                if hold_titles:
+                    print("\nAudiobook holds on your shelf (borrow in Libby before downloading):")
+                    for title in hold_titles:
+                        print(f"  - {title}")
                 if ebook_titles:
                     print("\nEbook loans on your shelf (not supported by this script):")
                     for title in ebook_titles:
@@ -1258,9 +1330,13 @@ def run():
 
                 # Fetch series/author metadata from title details before opening the player.
                 selected_tile = page.locator(
-                    '.title-list-tiles .title-tile.data-title-tile-format_audiobook'
+                    '.title-list-tiles .title-tile.data-tile-class_loan.data-title-tile-format_audiobook'
                 ).nth(choice_index)
                 selected_author = audiobook_authors[choice_index] if choice_index < len(audiobook_authors) else ""
+                if tile_is_hold(selected_tile):
+                    explain_hold_not_borrowed(selected_title, hold_status_from_tile(selected_tile))
+                    return
+
                 title_metadata = fetch_title_metadata(
                     page,
                     selected_tile,
@@ -1283,7 +1359,11 @@ def run():
                 # Open the tile the user picked by index - not by title text. Libby titles
                 # often contain non-breaking spaces that break :has-text() matching.
                 open_audiobook_button_selector = """button[role="button"]:has-text("Open Audiobook")"""
-                selected_tile.locator(open_audiobook_button_selector).click(timeout=PLAYWRIGHT_TIMEOUT_MS)
+                open_button = selected_tile.locator(open_audiobook_button_selector)
+                if open_button.count() == 0:
+                    explain_hold_not_borrowed(selected_title, hold_status_from_tile(selected_tile))
+                    return
+                open_button.click(timeout=PLAYWRIGHT_TIMEOUT_MS)
                 try:
                     page.wait_for_load_state('networkidle', timeout=PLAYWRIGHT_TIMEOUT_MS)
                 except PlaywrightTimeoutError:
