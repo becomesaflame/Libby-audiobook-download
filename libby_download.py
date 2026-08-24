@@ -286,13 +286,32 @@ def hold_status_from_tile(tile):
     return ''
 
 
+def pause_browser_for_manual_borrow():
+    """Leave Playwright open so the user can tap Borrow in the Libby UI.
+
+    TODO: once we have a ready-to-borrow hold to test against, add a text-menu
+    option here to click Borrow from the script instead of requiring a manual tap.
+    """
+    print("\nBrowser left open — tap 'Borrow' on the Libby shelf (or in title details).")
+    print("After borrowing, re-run this script once the tile shows 'Open Audiobook'.")
+    try:
+        input("Press Enter when you're done to close the browser...")
+    except EOFError:
+        # Non-interactive stdin (piped/CI): don't hang forever.
+        print("(No interactive stdin; closing browser.)")
+
+
 def explain_hold_not_borrowed(title, hold_status=''):
-    """Tell the user their audiobook hold must be borrowed before download."""
+    """Tell the user their audiobook hold must be borrowed before download.
+
+    Leaves the browser open so they can tap Borrow without re-logging in.
+    """
     print(f"\nCannot download '{title}': it is on your holds shelf, not borrowed yet.")
     if hold_status:
         print(f"Libby status: {hold_status}")
     print("Borrow it in Libby first (tap 'Borrow' on the shelf or in title details),")
     print("then re-run this script once the tile shows 'Open Audiobook'.")
+    pause_browser_for_manual_borrow()
     return True
 
 
@@ -1277,6 +1296,7 @@ def run():
                         print("\nYou do have audiobook holds, but none are borrowed yet:")
                         for title in hold_titles:
                             print(f"  - {title} (hold — tap Borrow in Libby first)")
+                        pause_browser_for_manual_borrow()
                     elif ebook_titles:
                         print("\nYou do have ebook loans on your shelf, but this script only downloads audiobooks:")
                         for title in ebook_titles:
