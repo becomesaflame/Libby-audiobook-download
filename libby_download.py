@@ -81,6 +81,54 @@ def next_expected_part():
     return expected
 
 
+def reset_download_state():
+    """Clear per-book download tracking so the next audiobook starts fresh."""
+    global downloaded_parts, found_parts, max_part_number_found
+    global active_downloads_count, _latest_libby_part_number_trigger
+    global _libby_url_template, _signed_spine_urls, _last_seen_part
+    global max_part_number_seen, _trigger_seq, downloads_enabled
+
+    downloaded_parts = set()
+    found_parts = set()
+    max_part_number_found = 0
+    active_downloads_count = 0
+    _latest_libby_part_number_trigger = None
+    _libby_url_template = None
+    _signed_spine_urls = {}
+    _last_seen_part = 0
+    max_part_number_seen = 0
+    _trigger_seq = 0
+    downloads_enabled = False
+
+
+def title_already_downloaded(title, downloaded_titles):
+    """True when title matches any title downloaded earlier in this session."""
+    return any(title_matches(title, done) for done in downloaded_titles)
+
+
+def navigate_to_shelf(page, screenshot_dir=None):
+    """Open the shelf tab and wait for loan tiles to appear."""
+    print("Returning to shelf...")
+    try:
+        page.click('#footer-nav-shelf')
+        try:
+            page.wait_for_load_state('networkidle', timeout=PLAYWRIGHT_TIMEOUT_MS)
+        except PlaywrightTimeoutError:
+            pass
+        time.sleep(2)
+        if screenshot_dir:
+            screenshot_path = os.path.join(screenshot_dir, "14_on_shelf_page.png")
+            page.screenshot(path=screenshot_path)
+        page.wait_for_selector('.title-list-tiles .title-tile', timeout=PLAYWRIGHT_TIMEOUT_MS)
+        return True
+    except PlaywrightTimeoutError:
+        print("Error: Could not return to the shelf.")
+        return False
+    except Exception as e:
+        print(f"Error returning to shelf: {e}")
+        return False
+
+
 SNAPSHOT_DIR = 'snapshots'
 
 
@@ -256,6 +304,26 @@ def collect_shelf_audiobook_loans(page):
     )
 
 
+def collect_available_audiobook_loans(page, downloaded_titles=()):
+    """Shelf loans excluding titles already downloaded in this session.
+
+    Returns (titles, authors, tile_indices) where tile_indices maps each listed
+    row back to audiobook_loan_tiles(page).nth(index).
+    """
+    all_titles, all_authors = collect_shelf_audiobook_loans(page)
+    if not downloaded_titles:
+        return all_titles, all_authors, list(range(len(all_titles)))
+
+    titles, authors, tile_indices = [], [], []
+    for i, (title, author) in enumerate(zip(all_titles, all_authors)):
+        if title_already_downloaded(title, downloaded_titles):
+            continue
+        titles.append(title)
+        authors.append(author)
+        tile_indices.append(i)
+    return titles, authors, tile_indices
+
+
 def collect_shelf_audiobook_holds(page):
     """Return (titles, authors) for audiobook holds, including ready-to-borrow."""
     return collect_shelf_titles(
@@ -287,11 +355,7 @@ def hold_status_from_tile(tile):
 
 
 def pause_browser_for_manual_borrow():
-    """Leave Playwright open so the user can tap Borrow in the Libby UI.
-
-    TODO: once we have a ready-to-borrow hold to test against, add a text-menu
-    option here to click Borrow from the script instead of requiring a manual tap.
-    """
+    """Leave Playwright open so the user can tap Borrow in the Libby UI."""
     print("\nBrowser left open — tap 'Borrow' on the Libby shelf (or in title details).")
     print("After borrowing, re-run this script once the tile shows 'Open Audiobook'.")
     try:
@@ -301,18 +365,247 @@ def pause_browser_for_manual_borrow():
         print("(No interactive stdin; closing browser.)")
 
 
-def explain_hold_not_borrowed(title, hold_status=''):
+def audiobook_hold_tiles(page):
+    """Locator for audiobook hold tiles on the shelf (ready or waiting)."""
+    return page.locator(
+        '.title-list-tiles .title-tile.data-tile-class_hold.data-title-tile-format_audiobook'
+    )
+
+
+def audiobook_loan_tiles(page):
+    """Locator for borrowed audiobook loan tiles on the shelf."""
+    return page.locator(
+        '.title-list-tiles .title-tile.data-tile-class_loan.data-title-tile-format_audiobook'
+    )
+
+
+def borrow_success_open_button(page):
+    """Open Audiobook on Libby's post-borrow success page (not the shelf tile)."""
+    return page.locator('button.circ-option-action:has-text("Open Audiobook")')
+
+
+def borrow_success_visible(page, title=None):
+    """True when Libby shows the post-borrow 'Borrowed until…' success screen."""
+    try:
+        open_btn = borrow_success_open_button(page)
+        if open_btn.count() == 0 or not open_btn.first.is_visible():
+            return False
+        if not title:
+            return True
+        circ_title = page.locator('.screen-title-circ-title').first
+        if circ_title.count():
+            return title_matches(title, normalize_text(circ_title.text_content()))
+        return True
+    except Exception:
+        return False
+
+
+def scrape_borrow_success_biblio(page):
+    """Title and author from the post-borrow success page."""
+    title = ''
+    author = ''
+    try:
+        title_el = page.locator('.screen-title-circ-title').first
+        if title_el.count():
+            title = normalize_text(title_el.text_content())
+        author_el = page.locator('.screen-title-circ-attribution').first
+        if author_el.count():
+            author = normalize_text(author_el.text_content())
+    except Exception:
+        pass
+    return title, author
+
+
+def click_open_audiobook(page, tile=None):
+    """Click Open Audiobook on the borrow-success page or a shelf loan tile."""
+    success_btn = borrow_success_open_button(page)
+    try:
+        if success_btn.count() > 0 and success_btn.first.is_visible():
+            print("Opening audiobook from borrow success page...")
+            success_btn.first.click(timeout=PLAYWRIGHT_TIMEOUT_MS)
+            return True
+    except Exception:
+        pass
+
+    if tile is not None:
+        open_btn = tile.locator('button[role="button"]:has-text("Open Audiobook")')
+        if open_btn.count() > 0:
+            print("Opening audiobook from shelf loan tile...")
+            open_btn.first.click(timeout=PLAYWRIGHT_TIMEOUT_MS)
+            return True
+
+    shelf_btn = page.locator(
+        '.title-tile.data-tile-class_loan.data-title-tile-format_audiobook '
+        'button[role="button"]:has-text("Open Audiobook")'
+    )
+    if shelf_btn.count() > 0:
+        print("Opening audiobook from shelf...")
+        shelf_btn.first.click(timeout=PLAYWRIGHT_TIMEOUT_MS)
+        return True
+    return False
+
+
+def borrow_audiobook_hold(page, tile, title):
+    """Click Borrow on a hold tile and wait until Libby shows it as a loan.
+
+    Returns True when borrow completes (success page or shelf loan tile).
+    """
+    borrow_link = tile.locator('a[href*="/borrow"]')
+    if borrow_link.count() == 0:
+        borrow_link = tile.locator('a:has-text("Borrow")')
+    if borrow_link.count() == 0:
+        print(f"  No Borrow link on hold tile for '{title}'.")
+        return False
+
+    print(f"Clicking Borrow for '{title}'...")
+    borrow_link.first.click(timeout=PLAYWRIGHT_TIMEOUT_MS)
+    try:
+        page.wait_for_load_state('networkidle', timeout=PLAYWRIGHT_TIMEOUT_MS)
+    except PlaywrightTimeoutError:
+        pass
+    time.sleep(2)
+    save_snapshot(page, "after_borrow_click")
+
+    # Libby opens a borrow confirmation page (title "Borrow: …") with a
+    # .circ-confirm-button. Do NOT match :has-text("Borrow") broadly — the shelf
+    # behind still has a disabled "Ready to borrow!" whisperer that steals the hit.
+    confirm = page.locator('button.circ-confirm-button')
+    try:
+        confirm.first.wait_for(state='visible', timeout=PLAYWRIGHT_TIMEOUT_MS)
+        print("Confirming borrow...")
+        confirm.first.scroll_into_view_if_needed()
+        confirm.first.click(timeout=PLAYWRIGHT_TIMEOUT_MS)
+        try:
+            page.wait_for_load_state('networkidle', timeout=PLAYWRIGHT_TIMEOUT_MS)
+        except PlaywrightTimeoutError:
+            pass
+        time.sleep(2)
+        save_snapshot(page, "after_borrow_confirm")
+    except PlaywrightTimeoutError:
+        # Some flows may complete without a confirm sheet.
+        print("  (No borrow confirm button appeared; checking for loan directly.)")
+    except Exception as e:
+        print(f"  (Borrow confirm failed: {e})")
+
+    print("Waiting for borrow to complete...")
+    # Success page appears immediately; shelf tiles behind may stay stale for a while.
+    wait_sec = min(45, PLAYWRIGHT_TIMEOUT_MS / 1000.0)
+    deadline = time.time() + wait_sec
+    while time.time() < deadline:
+        if borrow_success_visible(page, title):
+            print(f"Borrow succeeded: '{title}' (Open Audiobook on success page).")
+            save_snapshot(page, "after_borrow_loan")
+            return True
+
+        loans = audiobook_loan_tiles(page).all()
+        for loan_tile in loans:
+            try:
+                title_el = loan_tile.locator('.title-tile-title').first
+                loan_title = normalize_text(title_el.text_content()) if title_el else ''
+                if title_matches(title, loan_title):
+                    open_btn = loan_tile.locator(
+                        'button[role="button"]:has-text("Open Audiobook")'
+                    )
+                    if open_btn.count() > 0:
+                        print(f"Borrow succeeded: '{loan_title}' is on your loans shelf.")
+                        save_snapshot(page, "after_borrow_loan")
+                        return True
+            except Exception:
+                continue
+        time.sleep(0.5)
+
+    print(f"Timed out waiting for '{title}' borrow to complete.")
+    save_snapshot(page, "borrow_timeout")
+    return False
+
+
+def prompt_borrow_hold(page, preferred_title=''):
+    """Text menu: borrow a hold from the shelf, or leave the browser open for a manual tap.
+
+    Returns the borrowed title string on success, or None if the user cancels / borrows manually.
+    """
+    titles, _ = collect_shelf_audiobook_holds(page)
+    if not titles:
+        print("No audiobook holds found on the shelf.")
+        return None
+
+    tiles = audiobook_hold_tiles(page)
+    print("\nAudiobook holds (must borrow before downloading):")
+    preferred_index = None
+    for i, title in enumerate(titles):
+        status = ''
+        try:
+            status = hold_status_from_tile(tiles.nth(i))
+        except Exception:
+            pass
+        marker = ''
+        if preferred_title and title_matches(preferred_title, title):
+            preferred_index = i
+            marker = '  ← matched'
+        extra = f" — {status}" if status else ''
+        print(f"  {i + 1}. {title}{extra}{marker}")
+    print("  M. Leave browser open so you can borrow manually")
+
+    default_hint = ''
+    if preferred_index is not None:
+        default_hint = f" [{preferred_index + 1}]"
+    elif len(titles) == 1:
+        default_hint = " [1]"
+        preferred_index = 0
+
+    while True:
+        try:
+            choice = input(
+                f"Enter hold number to borrow{default_hint}, or M for manual: "
+            ).strip()
+        except EOFError:
+            print("(No interactive stdin; leaving browser open is not available.)")
+            return None
+
+        if not choice:
+            if preferred_index is not None:
+                choice = str(preferred_index + 1)
+            else:
+                pause_browser_for_manual_borrow()
+                return None
+
+        if choice.lower() == 'm':
+            pause_browser_for_manual_borrow()
+            return None
+
+        try:
+            idx = int(choice) - 1
+        except ValueError:
+            print("Invalid input. Enter a hold number or M.")
+            continue
+
+        if not (0 <= idx < len(titles)):
+            print("Invalid choice. Enter a hold number from the list, or M.")
+            continue
+
+        title = titles[idx]
+        tile = tiles.nth(idx)
+        if borrow_audiobook_hold(page, tile, title):
+            return title
+        print("Borrow did not complete. Pick another hold, try again, or choose M.")
+
+
+def explain_hold_not_borrowed(title, hold_status='', page=None):
     """Tell the user their audiobook hold must be borrowed before download.
 
-    Leaves the browser open so they can tap Borrow without re-logging in.
+    If page is provided, offer the in-script borrow menu; otherwise leave the
+    browser open for a manual Borrow tap.
     """
     print(f"\nCannot download '{title}': it is on your holds shelf, not borrowed yet.")
     if hold_status:
         print(f"Libby status: {hold_status}")
+    if page is not None:
+        borrowed = prompt_borrow_hold(page, preferred_title=title)
+        return borrowed  # title string on success, None if cancelled
     print("Borrow it in Libby first (tap 'Borrow' on the shelf or in title details),")
     print("then re-run this script once the tile shows 'Open Audiobook'.")
     pause_browser_for_manual_borrow()
-    return True
+    return None
 
 
 def title_matches(requested, candidate):
@@ -325,20 +618,28 @@ def title_matches(requested, candidate):
 
 
 def explain_missing_audiobook(page, requested_title):
-    """If the user asked for a title that is on loan as an ebook, say so plainly."""
+    """Explain why a requested title isn't a downloadable loan.
+
+    Returns the borrowed title string if the user borrowed a matching hold via
+    the in-script menu; otherwise None (caller should stop).
+    """
     hold_titles, _ = collect_shelf_audiobook_holds(page)
     for hold_title in hold_titles:
         if title_matches(requested_title, hold_title):
-            hold_tiles = page.locator(
-                '.title-list-tiles .title-tile.data-tile-class_hold.data-title-tile-format_audiobook'
-            ).all()
             hold_status = ''
-            for tile in hold_tiles:
+            tiles = audiobook_hold_tiles(page)
+            for i in range(tiles.count()):
+                tile = tiles.nth(i)
                 title_element = tile.locator('.title-tile-title').first
-                if title_element and title_matches(requested_title, normalize_text(title_element.text_content())):
-                    hold_status = hold_status_from_tile(tile)
-                    break
-            return explain_hold_not_borrowed(requested_title, hold_status)
+                try:
+                    if title_element and title_matches(
+                        requested_title, normalize_text(title_element.text_content())
+                    ):
+                        hold_status = hold_status_from_tile(tile)
+                        break
+                except Exception:
+                    continue
+            return explain_hold_not_borrowed(requested_title, hold_status, page=page)
 
     ebook_titles, _ = collect_shelf_titles(page, 'data-title-tile-format_book')
     for ebook_title in ebook_titles:
@@ -347,10 +648,10 @@ def explain_missing_audiobook(page, requested_title):
             print("This script only downloads audiobooks (MP3 parts from the Libby player).")
             print("In Libby, search for the title again and borrow the audiobook edition (headphones icon),")
             print("then re-run this script once it appears on your shelf with 'Open Audiobook'.")
-            return True
+            return None
     print(f"\n'{requested_title}' was not found as an audiobook on your shelf.")
     print("Make sure you've borrowed the audiobook edition and it shows 'Open Audiobook' in Libby.")
-    return False
+    return None
 
 
 def normalize_text(text):
@@ -1268,600 +1569,753 @@ def run():
                       "The footer navigation might have changed or not loaded.")
                 return
 
-            # --- Prompt user for audiobook selection on the shelf ---
-            print("\nAudiobooks on your Shelf:")
-            save_snapshot(page, "shelf")
-            try:
-                # Only audiobook tiles can be opened in the Libby player. Ebook loans use
-                # "Read With..." and are listed separately so users know why a title is missing.
-                page.wait_for_selector('.title-list-tiles .title-tile', timeout=PLAYWRIGHT_TIMEOUT_MS)
+            base_download_dir = config['DOWNLOAD_DIRECTORY']
+            downloaded_this_session = []
 
-                audiobook_titles, audiobook_authors = collect_shelf_audiobook_loans(page)
-                hold_titles, _ = collect_shelf_audiobook_holds(page)
-                ebook_titles, _ = collect_shelf_titles(page, 'data-title-tile-format_book')
-
-                print(f"DEBUG: Parsed Audiobook Titles: {audiobook_titles}")
-                print(f"DEBUG: Parsed Audiobook Authors: {audiobook_authors}")
-                if hold_titles:
-                    print(f"DEBUG: Audiobook holds on shelf (borrow first, not downloadable yet): {hold_titles}")
-                if ebook_titles:
-                    print(f"DEBUG: Ebook-only loans on shelf (not downloadable here): {ebook_titles}")
-
-                if not audiobook_titles:
-                    print("No borrowed audiobooks found on your shelf.")
-                    preselect_title = normalize_text(os.environ.get('LIBBY_BOOK_TITLE', ''))
-                    if preselect_title:
-                        explain_missing_audiobook(page, preselect_title)
-                    elif hold_titles:
-                        print("\nYou do have audiobook holds, but none are borrowed yet:")
-                        for title in hold_titles:
-                            print(f"  - {title} (hold — tap Borrow in Libby first)")
-                        pause_browser_for_manual_borrow()
-                    elif ebook_titles:
-                        print("\nYou do have ebook loans on your shelf, but this script only downloads audiobooks:")
-                        for title in ebook_titles:
-                            print(f"  - {title} (ebook)")
-                    return
-
-                # Prompt user for which audiobook on their shelf they want to download.
-                for i, title in enumerate(audiobook_titles):
-                    print(f"{i+1}. {title}")
-                if hold_titles:
-                    print("\nAudiobook holds on your shelf (borrow in Libby before downloading):")
-                    for title in hold_titles:
-                        print(f"  - {title}")
-                if ebook_titles:
-                    print("\nEbook loans on your shelf (not supported by this script):")
-                    for title in ebook_titles:
-                        print(f"  - {title}")
-
-                # Non-interactive preselect by title (for unattended/testing runs):
-                # LIBBY_BOOK_TITLE=Wicked picks the first shelf title containing the
-                # string, case-insensitively. Shelf order is not stable, so piping a
-                # number into stdin can select the wrong book.
-                preselect_title = normalize_text(os.environ.get('LIBBY_BOOK_TITLE', ''))
-                preselect_matches = [i for i, t in enumerate(audiobook_titles) if preselect_title and title_matches(preselect_title, t)]
-                if preselect_matches:
-                    choice_index = preselect_matches[0]
-                    selected_title = audiobook_titles[choice_index]
-                    print(f"Preselected via LIBBY_BOOK_TITLE={preselect_title!r}: '{selected_title}'")
-                elif preselect_title:
-                    explain_missing_audiobook(page, preselect_title)
-                    return
-                # Select audiobook (auto-select only when there's a single option)
-                elif AUTO_SELECT_FIRST_AUDIOBOOK and len(audiobook_titles) == 1:
-                    choice_index = 0
-                    selected_title = audiobook_titles[choice_index]
-                    print(f"Auto-selected the only audiobook on the shelf: '{selected_title}'")
-                else:
-                    # Loop until a valid choice is made
-                    selected_title = None
-                    while selected_title is None:
-                        try:
-                            choice = input("Enter the number of the audiobook to open: ")
-                            choice_index = int(choice) - 1
-                            if 0 <= choice_index < len(audiobook_titles):
-                                selected_title = audiobook_titles[choice_index]
-                                print(f"You selected: '{selected_title}'")
-                            else:
-                                print("Invalid choice. Please enter a number from the list.")
-                        except ValueError:
-                            print("Invalid input. Please enter a number.")
-
-                # Fetch series/author metadata from title details before opening the player.
-                selected_tile = page.locator(
-                    '.title-list-tiles .title-tile.data-tile-class_loan.data-title-tile-format_audiobook'
-                ).nth(choice_index)
-                selected_author = audiobook_authors[choice_index] if choice_index < len(audiobook_authors) else ""
-                if tile_is_hold(selected_tile):
-                    explain_hold_not_borrowed(selected_title, hold_status_from_tile(selected_tile))
-                    return
-
-                title_metadata = fetch_title_metadata(
-                    page,
-                    selected_tile,
-                    fallback_title=selected_title,
-                    fallback_author=selected_author,
-                )
-
-                book_download_dir = build_book_download_dir(
-                    config['DOWNLOAD_DIRECTORY'],
-                    title_metadata,
-                    fallback_title=selected_title,
-                    fallback_author=selected_author,
-                )
-                print(f"Download directory for this book: {book_download_dir}")
-                os.makedirs(book_download_dir, exist_ok=True)
-                download_cover_image(title_metadata.get('cover_url'), book_download_dir)
-                config['DOWNLOAD_DIRECTORY'] = book_download_dir
-                book_folder_name = os.path.basename(book_download_dir)
-
-                # Open the tile the user picked by index - not by title text. Libby titles
-                # often contain non-breaking spaces that break :has-text() matching.
-                open_audiobook_button_selector = """button[role="button"]:has-text("Open Audiobook")"""
-                open_button = selected_tile.locator(open_audiobook_button_selector)
-                if open_button.count() == 0:
-                    explain_hold_not_borrowed(selected_title, hold_status_from_tile(selected_tile))
-                    return
-                open_button.click(timeout=PLAYWRIGHT_TIMEOUT_MS)
-                try:
-                    page.wait_for_load_state('networkidle', timeout=PLAYWRIGHT_TIMEOUT_MS)
-                except PlaywrightTimeoutError:
-                    pass  # Libby's SPA often never reaches networkidle; the player still loads
-                time.sleep(3)
-                filename = f"15_after_open_audiobook_button_{book_folder_name.replace(' ', '_')}.png"
-                screenshot_path = os.path.join(config['DOWNLOAD_DIRECTORY'], filename)
-                page.screenshot(path=screenshot_path)
-
-            except PlaywrightTimeoutError as e:
-                print(f"Error: Timed out while opening the selected audiobook on the shelf: {e}")
-                return
-            except Exception as e:
-                print(f"An error occurred while listing/selecting audiobooks: {e}")
-                return
-
-            print("Audiobook player opened. Rewinding to beginning...")
-            time.sleep(5)
-            save_snapshot(page, "player_opened")
-            screenshot_path = os.path.join(config['DOWNLOAD_DIRECTORY'], "16_after_audiobook_detail_load.png")
-            page.screenshot(path=screenshot_path)
-
-            # Navigate to the beginning of the book so the forward pass starts from Part 1.
-            # Recording is gated to strict ascending order (see handle_request), so the
-            # resume position that loaded above was ignored; Part 1 will be the first part
-            # accepted once the rewind navigation triggers it.
-            global downloads_enabled, _latest_libby_part_number_trigger
-            try:
-                player_frame_init = page.frame_locator('iframe[src*="listen.libbyapp.com"]')
-                prev_btn = player_frame_init.locator('button[aria-label*="Previous Chapter"]')
-                # Wait for the player to be ready before rewinding, keyed on the Next Chapter
-                # button. That button is present throughout the book, whereas Previous Chapter
-                # is hidden at the very start - so waiting on Previous Chapter would stall for
-                # the full timeout whenever the book opens at/near the beginning.
-                try:
-                    player_frame_init.locator('button[aria-label*="Next Chapter"]').first.wait_for(state='visible', timeout=PLAYWRIGHT_TIMEOUT_MS)
-                except PlaywrightTimeoutError:
-                    print("Warning: player controls did not become visible within 60s; rewind may fail.")
-
-                # The initial auto-load (resume position + manifest traffic) is done. Enable
-                # the handler now so the rewind navigation's Part 1 trigger is the first
-                # thing captured - not the mid-book resume position that loaded above.
-                downloads_enabled = True
-                print("Rewind step reached: request handler enabled, capturing from Part 1 onward.")
-
-                # If Libby shows a "Recent place" history-back button pointing near the
-                # start of the book, click it to jump straight there instead of stepping
-                # back one chapter at a time.
-                try:
-                    back_btn = player_frame_init.locator('button.history-bar-back-button')
-                    if back_btn.count() > 0 and back_btn.first.is_visible():
-                        place_text = back_btn.first.locator('.place-phrase-visual').first.text_content().strip()
-                        total_sec = 0
-                        for segment in place_text.split(':'):
-                            total_sec = total_sec * 60 + int(segment)
-                        if total_sec == 0:
-                            print(f"History-back button offers recent place {place_text}; jumping straight to it.")
-                            back_btn.first.click(timeout=3000)
-                            time.sleep(3)
-                        else:
-                            print(f"History-back button present but points to {place_text}; ignoring it.")
-                except Exception as e:
-                    print(f"History-back shortcut not used: {e}")
-
-                for rewind_i in range(300):
-                    try:
-                        prev_btn.first.click(timeout=2000)
-                        time.sleep(0.5)
-                    except (PlaywrightTimeoutError, Exception):
-                        print(f"Reached beginning of book after {rewind_i} Previous Chapter clicks.")
-                        break
-                time.sleep(3)
-            except Exception as e:
-                print(f"Error rewinding to beginning: {e}")
-
-            # --- Step 3: Player Control and Forward Part Discovery ---
-            initial_parts_count = len(downloaded_parts)
-            no_new_parts_count = 0
-            MAX_NO_NEW_PARTS_ITERATIONS = 10 # Stop if no new parts found for this many clicks
-            MAX_FORWARD_CLICKS = 500 # Safety limit for forward clicks
-
-            MAX_SEEK_PROBES = 20          # Binary-search probes per missing part (resolution ~1/2^20 of the slider)
-            SEEK_TRIGGER_TIMEOUT_SEC = 12  # Max wait for a fresh part trigger after a seek probe (the player defers loading after rapid scrubs)
-            MAX_GAP_SKIP_CLICKS = 200     # Fallback 15s-skip budget floor when no seek slider is found
-            GAP_SKIP_WAIT_SEC = 2         # Wait after each seek/skip for the part trigger to fire
-
-            for i in range(MAX_FORWARD_CLICKS):
-                current_parts_count = len(downloaded_parts)
-                expected_next_part = next_expected_part()  # Next part we still need, in order
-                print(f"Forward pass iteration {i+1}. Current parts downloaded: {current_parts_count} (expect next part {expected_next_part})")
-
-                # Advance with the "Next Chapter" button only (aria-label match). This has
-                # proven reliable; the old fallback selectors (chapter-bar-next-button,
-                # 15s-skip, JS clicks) were removed because they stay present-but-hidden at
-                # the end of the book and kept the loop "advancing" forever.
-                player_frame = page.frame_locator('iframe[src*="listen.libbyapp.com"]')
-                next_chapter_btn = player_frame.locator('button[aria-label*="Next Chapter"]')
-
-                # Log the button's state every iteration so its behaviour (especially at the
-                # end of the book, where it becomes present-but-hidden) is always visible.
-                nc_count = -1
-                nc_visible = False
-                nc_aria = None
-                nc_bbox = None
-                try:
-                    nc_count = next_chapter_btn.count()
-                    if nc_count > 0:
-                        first_btn = next_chapter_btn.first
-                        nc_visible = first_btn.is_visible()
-                        nc_aria = first_btn.get_attribute('aria-label')
-                        nc_bbox = first_btn.bounding_box()
-                except Exception as e:
-                    print(f"  [next-chapter] error reading button metadata: {e}")
-                print(f"  [next-chapter] count={nc_count} visible={nc_visible} aria-label={nc_aria!r} bbox={nc_bbox}")
-
-                # End of book: the Next Chapter button is gone or no longer visible (it stays
-                # in the DOM but hidden on the last chapter). Playback never reaches the true
-                # audio end via chapter skips, so this - not the play button's "The End"
-                # text - is our stop signal.
-                if nc_count == 0 or not nc_visible:
-                    print("End of book detected: 'Next Chapter' button is not present/visible. Stopping forward pass.")
-                    save_snapshot(page, "end_of_book")
-                    break
-
-                button_found = False
-                try:
-                    next_chapter_btn.first.click(timeout=2000)
-                    print("  Clicked Next Chapter.")
-                    button_found = True
-                    time.sleep(5)
-                except (PlaywrightTimeoutError, Exception) as e:
-                    print(f"  Next Chapter click failed despite being visible: {e}")
-                    break # Treat an unclickable button as end of book
-
-                # Gap recovery: chapters can span multiple audio parts, so a Next
-                # Chapter jump can skip over the start of a part entirely (e.g. it lands
-                # on Part 6 while Part 5 was never played). Because recording is gated to
-                # ascending order, the skipped part simply never got accepted: the next
-                # expected part is still missing even though we've now seen a higher part.
-                # When that happens, step back chapter-by-chapter until the player is
-                # positioned BEFORE the missing part, then advance in 15s steps; each
-                # skipped part triggers in order and is accepted as we pass through it.
-                if button_found:
-                    time.sleep(2)  # let the part trigger from the chapter jump arrive
-                    landed = _last_seen_part  # highest part the player has reached so far
-                    missing_part = expected_next_part
-                    if landed > missing_part:
-                        print(f"Gap detected: player reached Part {landed} but Part {missing_part} was skipped. Stepping back to before Part {missing_part}...")
-                        save_snapshot(page, f"gap_recovery_part{missing_part}")
-                        player_frame = page.frame_locator('iframe[src*="listen.libbyapp.com"]')
-                        # We're sitting at the overshoot chapter's start right now: the
-                        # missing part's boundary lies BEFORE this tape position. Record it
-                        # as the upper bound for the seek search below.
-                        gap_hi_px = tape_position_px(player_frame)
-                        prev_chapter_btn = player_frame.locator('button[aria-label*="Previous Chapter"]')
-
-                        # Step back one chapter at a time until the player lands on a part
-                        # earlier than the one we're missing (a single chapter back is often
-                        # not enough - the skipped part can start several chapters earlier).
-                        MAX_BACK_CHAPTERS = 15
-                        back_clicks = 0
-                        while back_clicks < MAX_BACK_CHAPTERS:
-                            try:
-                                prev_chapter_btn.first.click(timeout=3000)
-                            except (PlaywrightTimeoutError, Exception) as e:
-                                print(f"  Reached start of book while stepping back ({e}).")
-                                break
-                            back_clicks += 1
-                            time.sleep(2)
-                            if _last_seen_part and _last_seen_part < missing_part:
-                                print(f"  Stepped back {back_clicks} chapter(s) to Part {_last_seen_part}; now scanning forward for Part {missing_part}.")
-                                break
-                        else:
-                            print(f"  Stepped back {back_clicks} chapters (cap reached); scanning forward from here.")
-
-                        # Binary-search the seekometer tape for the missing part(s).
-                        # The tape is time-linear over the whole book (2px/sec), so seeking
-                        # to a tape position triggers that position's part request, and
-                        # position -> part number is monotonic: each probe halves the
-                        # interval. The order gate reads out the result: overshoot probes
-                        # are ignored, and the probe that lands inside the target part is
-                        # the expected one, so it's accepted and downloads.
-                        # Search between here (known to be in a part < target after the
-                        # step-back) and the overshoot chapter's start captured above.
-                        lo = tape_position_px(player_frame)
-                        hi = gap_hi_px
-                        if hi is None:
-                            try:
-                                tape_w = player_frame.locator('.seekometer-tape').first.evaluate("el => el.getBoundingClientRect().width")
-                                hi = float(tape_w)
-                            except Exception as e:
-                                print(f"  [tape-seek] could not read tape width ({e})")
-                        seek_ok = lo is not None and hi is not None and hi > lo
-                        if not seek_ok:
-                            print(f"  [seek-search] no usable tape bounds (lo={lo}, hi={hi}); falling back to 15s skips.")
-                        if seek_ok:
-                            while next_expected_part() < landed and seek_ok:
-                                target = next_expected_part()
-                                s_lo, s_hi = lo, hi
-                                probes = 0
-                                while probes < MAX_SEEK_PROBES and next_expected_part() == target:
-                                    if s_hi - s_lo < 30:  # interval down to ~15s of audio; boundary pinned
-                                        print(f"  [seek-search] interval collapsed to {s_hi - s_lo:.0f}px without capturing Part {target}.")
-                                        break
-                                    mid = (s_lo + s_hi) / 2.0
-                                    seq_before = _trigger_seq
-                                    landed_px = seek_tape_to_px(page, player_frame, mid)
-                                    if landed_px is None:
-                                        print("  [seek-search] tape drag failed; falling back to 15s skips.")
-                                        seek_ok = False
-                                        break
-                                    probes += 1
-                                    # Wait for a FRESH trigger from this seek before classifying
-                                    # the probe - a fixed short sleep can read a stale part number
-                                    # and misclassify. Seeks within the already-loaded part fire
-                                    # no new trigger, so on timeout the stale value IS correct.
-                                    probe_deadline = time.time() + SEEK_TRIGGER_TIMEOUT_SEC
-                                    while time.time() < probe_deadline and _trigger_seq == seq_before:
-                                        time.sleep(0.25)
-                                    fresh = _trigger_seq != seq_before
-                                    if fresh:
-                                        # Scrubbing fires triggers for parts merely passed over.
-                                        # Wait for the stream to go quiet (2s) so we read the
-                                        # trigger belonging to the tape's resting position.
-                                        last_seq = _trigger_seq
-                                        quiet_since = time.time()
-                                        settle_deadline = time.time() + 8
-                                        while time.time() < settle_deadline and (time.time() - quiet_since) < 2.0:
-                                            time.sleep(0.25)
-                                            if _trigger_seq != last_seq:
-                                                last_seq = _trigger_seq
-                                                quiet_since = time.time()
-                                    cur = _last_seen_part
-                                    # Classify against where the tape actually SETTLED, not the
-                                    # requested midpoint - drags aren't pixel-accurate and the
-                                    # tape can drift after release; narrowing by the wrong
-                                    # coordinate corrupts the interval.
-                                    settled_px = tape_position_px(player_frame)
-                                    if settled_px is None:
-                                        settled_px = landed_px
-                                    print(f"  [seek-search] probe {probes}/{MAX_SEEK_PROBES}: tape_px={settled_px:.0f} (~{settled_px / TAPE_PX_PER_SEC / 60:.1f} min) -> part {cur} ({'fresh trigger' if fresh else 'no new trigger'}, target {target})")
-                                    if cur < target:
-                                        s_lo = max(s_lo, settled_px)
-                                    elif cur > target:
-                                        s_hi = min(s_hi, settled_px)
-                                if not seek_ok:
-                                    break
-                                if next_expected_part() == target:
-                                    print(f"  Seek search could not trigger Part {target} in {probes} probes; falling back to 15s skips.")
-                                    break
-                                print(f"  Seek search captured Part {target} in {probes} probes.")
-                                lo = tape_position_px(player_frame) or lo  # continue from here for the next missing part
-
-                        # Fallback when no slider was found or the search stalled: play
-                        # through the chapter in 15s steps, budgeted from the chapter length
-                        # in the Next Chapter label ("Next Chapter . 88 minutes ahead.").
-                        if next_expected_part() < landed:
-                            skip_budget = MAX_GAP_SKIP_CLICKS
-                            try:
-                                label = player_frame.locator('button[aria-label*="Next Chapter"]').first.get_attribute('aria-label') or ""
-                                hours_m = re.search(r'(\d+)\s*hour', label)
-                                minutes_m = re.search(r'(\d+)\s*minute', label)
-                                total_min = (int(hours_m.group(1)) * 60 if hours_m else 0) + (int(minutes_m.group(1)) if minutes_m else 0)
-                                if total_min:
-                                    skip_budget = max(skip_budget, (total_min * 60) // 15 + 20)
-                                    print(f"  Chapter ahead is ~{total_min} min of audio; skip budget set to {skip_budget}.")
-                            except Exception as e:
-                                print(f"  Could not read chapter length for skip budget ({e}); using default {skip_budget}.")
-
-                            skip_btn = player_frame.locator('button[aria-label*="Advance 15 seconds"], button.mini-player-jump-ahead')
-                            skip_clicks = 0
-                            while next_expected_part() < landed and skip_clicks < skip_budget:
-                                try:
-                                    skip_btn.first.click(timeout=3000)
-                                except (PlaywrightTimeoutError, Exception) as e:
-                                    print(f"  15s advance failed during gap recovery: {e}")
-                                    break
-                                skip_clicks += 1
-                                time.sleep(GAP_SKIP_WAIT_SEC)
-                                if skip_clicks % 20 == 0:
-                                    print(f"  Gap recovery: {skip_clicks}/{skip_budget} skips so far, next still-missing part is {next_expected_part()} (filling up to {landed - 1})")
-
-                        if next_expected_part() < landed:
-                            print(f"  Gap recovery gave up; Part {next_expected_part()} still missing (Step 4 will retry).")
-                        else:
-                            print(f"  Gap recovery done; parts up to {landed - 1} captured. Resuming chapter skips to reach Part {landed}.")
-
-                        # An accepted trigger only marks the part; the browser's CDN audio
-                        # fetch is still in flight. Clicking Next Chapter now can abort that
-                        # fetch ("No Playwright response object"), losing the part until the
-                        # Step 4 retry. Let pending downloads settle before navigating away.
-                        pending = []
-                        wait_deadline = time.time() + 20
-                        while time.time() < wait_deadline:
-                            with active_downloads_lock:
-                                pending = sorted(p for p in found_parts if p not in downloaded_parts)
-                            if not pending:
-                                break
-                            time.sleep(1)
-                        if pending:
-                            print(f"  Warning: recovered part(s) {pending} still not downloaded after 20s; Step 4 will retry them.")
-
-                if len(downloaded_parts) == current_parts_count:
-                    no_new_parts_count += 1
-                    print(f"No new parts detected in this iteration ({no_new_parts_count}/{MAX_NO_NEW_PARTS_ITERATIONS}).")
-                    if no_new_parts_count >= MAX_NO_NEW_PARTS_ITERATIONS:
-                        print("Stopping forward pass: No new parts found for several iterations.")
-                        break
-                else:
-                    no_new_parts_count = 0 # Reset counter if new parts were found
-
-            print(f"Forward pass complete. Total unique parts found: {len(downloaded_parts)}")
-            print(f"Highest part number downloaded: {max_part_number_found}; highest part number seen in any trigger: {max_part_number_seen}")
-
-            # --- Wait for all active downloads to complete before proceeding ---
-            print("Waiting for all active downloads to complete...")
             while True:
-                with active_downloads_lock:
-                    current_active = active_downloads_count
-                if current_active == 0:
-                    print("All downloads appear to be complete.")
-                    break
-                print(f"Still {current_active} downloads active. Waiting...")
-                time.sleep(5) # Wait a bit before checking again
-
-            # --- Step 4: Retrieve Missing Parts via Signed URL Extraction ---
-            print("Checking for any missing parts and attempting to retrieve them...")
-            # Range over the highest part SEEN, not just downloaded: parts skipped by
-            # chapter jumps were never accepted, so max_part_number_found alone would
-            # undercount and silently declare success with parts missing (e.g. a run
-            # that downloaded 1-8 but saw triggers for 11 is missing 9-11, not "done").
-            highest_known_part = max(max_part_number_found, max_part_number_seen)
-            missing_parts = []
-            for i in range(1, highest_known_part + 1):
-                if i not in downloaded_parts:
-                    missing_parts.append(i)
-
-            if not missing_parts:
-                print("No missing parts detected. All parts downloaded successfully!")
-            else:
-                print(f"Missing parts identified: {sorted(missing_parts)}")
-
-                # These parts' triggers were accepted during the forward pass, but the
-                # audio download never completed. The order gate in handle_request keys
-                # on found_parts, so unless we evict them it would reject every re-trigger
-                # as out-of-order (expecting a part past the end of the book) and the
-                # retries below could never succeed.
-                with active_downloads_lock:
-                    for p in missing_parts:
-                        found_parts.discard(p)
-                    _latest_libby_part_number_trigger = None
-
-                player_frame_obj = None
-                for frame in page.frames:
-                    if 'listen.libbyapp.com' in frame.url:
-                        player_frame_obj = frame
-                        break
-
-                # Try to extract all signed spine URLs from the player's JavaScript
-                if player_frame_obj and len(_signed_spine_urls) < highest_known_part:
-                    print("Extracting signed spine URLs from player...")
-                    try:
-                        spine_data = player_frame_obj.evaluate(r"""
-                            () => {
-                                try {
-                                    var results = {};
-                                    var scripts = document.querySelectorAll('script');
-                                    for (var s of scripts) {
-                                        var text = s.textContent || '';
-                                        var matches = text.matchAll(/Part(\d+)\.mp3\?cmpt=([A-Za-z0-9+\/=%]+--[a-f0-9]+)/g);
-                                        for (var m of matches) {
-                                            results[parseInt(m[1])] = m[2];
-                                        }
-                                    }
-                                    function searchObj(obj, depth) {
-                                        if (depth > 3 || !obj) return;
-                                        try {
-                                            if (typeof obj === 'string' && obj.includes('cmpt=') && obj.includes('Part')) {
-                                                var m = obj.match(/Part(\d+)\.mp3\?cmpt=([A-Za-z0-9+\/=%]+--[a-f0-9]+)/);
-                                                if (m) results[parseInt(m[1])] = m[2];
-                                            }
-                                            if (typeof obj === 'object') {
-                                                for (var k in obj) {
-                                                    try { searchObj(obj[k], depth + 1); } catch(e) {}
-                                                }
-                                            }
-                                        } catch(e) {}
-                                    }
-                                    try { searchObj(window.__NEXT_DATA__, 0); } catch(e) {}
-                                    try { searchObj(window.__STATE__, 0); } catch(e) {}
-                                    try { searchObj(window.roster, 0); } catch(e) {}
-                                    return {found: Object.keys(results).length, urls: results};
-                                } catch(e) {
-                                    return {error: e.message, found: 0, urls: {}};
-                                }
-                            }
-                        """)
-                        print(f"  Spine URL extraction: found {spine_data.get('found', 0)} signed URLs")
-                        if spine_data.get('urls'):
-                            for part_str, cmpt in spine_data['urls'].items():
-                                part_num = int(part_str)
-                                if part_num not in _signed_spine_urls and _libby_url_template:
-                                    full_url = f"{_libby_url_template}Part{part_num:02d}.mp3?cmpt={cmpt}"
-                                    _signed_spine_urls[part_num] = full_url
-                    except Exception as e:
-                        print(f"  Spine URL extraction failed: {e}")
-
-                for missing_part in sorted(missing_parts):
-                    if missing_part in downloaded_parts:
-                        continue
-                    print(f"Attempting to retrieve missing Part {missing_part} (spine {missing_part - 1})...")
-
-                    # Method 1: Use stored signed URL if available
-                    if missing_part in _signed_spine_urls and missing_part not in downloaded_parts:
-                        signed_url = _signed_spine_urls[missing_part]
-                        print(f"  Using signed URL for Part {missing_part}...")
-                        try:
-                            if player_frame_obj:
-                                player_frame_obj.evaluate("""
-                                    (url) => {
-                                        var audio = new Audio();
-                                        audio.src = url;
-                                        audio.load();
-                                    }
-                                """, signed_url)
-                                time.sleep(8)
-                        except Exception as e:
-                            print(f"  Signed URL fetch failed: {e}")
-
-                    if missing_part in downloaded_parts:
-                        print(f"  Successfully retrieved Part {missing_part}!")
+                # --- Prompt user for audiobook selection on the shelf ---
+                print("\nAudiobooks on your Shelf:")
+                save_snapshot(page, "shelf")
+                try:
+                    # Only audiobook tiles can be opened in the Libby player. Ebook loans use
+                    # "Read With..." and are listed separately so users know why a title is missing.
+                    page.wait_for_selector('.title-list-tiles .title-tile', timeout=PLAYWRIGHT_TIMEOUT_MS)
+    
+                    audiobook_titles, audiobook_authors, tile_indices = collect_available_audiobook_loans(
+                        page, downloaded_this_session
+                    )
+                    hold_titles, _ = collect_shelf_audiobook_holds(page)
+                    ebook_titles, _ = collect_shelf_titles(page, 'data-title-tile-format_book')
+    
+                    print(f"DEBUG: Parsed Audiobook Titles: {audiobook_titles}")
+                    print(f"DEBUG: Parsed Audiobook Authors: {audiobook_authors}")
+                    if hold_titles:
+                        print(f"DEBUG: Audiobook holds on shelf (borrow first, not downloadable yet): {hold_titles}")
+                    if ebook_titles:
+                        print(f"DEBUG: Ebook-only loans on shelf (not downloadable here): {ebook_titles}")
+    
+                    force_select_title = None
+                    opened_from_borrow_success = False
+                    first_book = not downloaded_this_session
+                    if not audiobook_titles:
+                        if downloaded_this_session:
+                            break
+                        print("No borrowed audiobooks found on your shelf.")
+                        preselect_title = (
+                            normalize_text(os.environ.get('LIBBY_BOOK_TITLE', '')) if first_book else ''
+                        )
+                        if preselect_title:
+                            borrowed = explain_missing_audiobook(page, preselect_title)
+                            if not borrowed:
+                                return
+                            force_select_title = borrowed
+                        elif hold_titles:
+                            borrowed = prompt_borrow_hold(page)
+                            if not borrowed:
+                                return
+                            force_select_title = borrowed
+                        elif ebook_titles:
+                            print("\nYou do have ebook loans on your shelf, but this script only downloads audiobooks:")
+                            for title in ebook_titles:
+                                print(f"  - {title} (ebook)")
+                            return
+                        else:
+                            return
+    
+                        audiobook_titles, audiobook_authors, tile_indices = collect_available_audiobook_loans(
+                            page, downloaded_this_session
+                        )
+                        hold_titles, _ = collect_shelf_audiobook_holds(page)
+                        if borrow_success_visible(page, force_select_title):
+                            opened_from_borrow_success = True
+                            print("Borrow complete — Open Audiobook is on Libby's success page (shelf may not have refreshed yet).")
+                        elif not audiobook_titles:
+                            print("Borrow finished but no audiobook loan appeared on the shelf.")
+                            pause_browser_for_manual_borrow()
+                            return
+                        else:
+                            print(f"DEBUG: Loans after borrow: {audiobook_titles}")
+    
+                    selected_title = None
+                    selected_author = ''
+                    selected_tile = None
+                    choice_index = None
+    
+                    if opened_from_borrow_success:
+                        selected_title, selected_author = scrape_borrow_success_biblio(page)
+                        if not selected_title:
+                            selected_title = force_select_title
+                        print(f"Continuing with newly borrowed audiobook: '{selected_title}'")
                     else:
-                        print(f"  Failed to retrieve Part {missing_part}.")
-
-                # Method 2: Systematic forward scan from beginning for remaining missing parts
-                still_missing = [p for p in missing_parts if p not in downloaded_parts]
-                if still_missing:
-                    print(f"\nSystematic scan for {len(still_missing)} remaining missing parts: {still_missing}")
-                    player_fl = page.frame_locator('iframe[src*="listen.libbyapp.com"]')
-
-                    print("  Rewinding to beginning...")
-                    for _ in range(50):
+                        # Prompt user for which audiobook on their shelf they want to download.
+                        if downloaded_this_session:
+                            print("0. Quit")
+                        for i, title in enumerate(audiobook_titles):
+                            print(f"{i+1}. {title}")
+                        if hold_titles:
+                            print("\nAudiobook holds on your shelf (borrow in Libby before downloading):")
+                            for title in hold_titles:
+                                print(f"  - {title}")
+                        if ebook_titles:
+                            print("\nEbook loans on your shelf (not supported by this script):")
+                            for title in ebook_titles:
+                                print(f"  - {title}")
+    
+                        # Non-interactive preselect by title (for unattended/testing runs):
+                        preselect_title = (
+                            normalize_text(os.environ.get('LIBBY_BOOK_TITLE', '')) if first_book else ''
+                        )
+                        if force_select_title:
+                            matches = [
+                                i for i, t in enumerate(audiobook_titles)
+                                if title_matches(force_select_title, t)
+                            ]
+                            choice_index = matches[0] if matches else 0
+                            selected_title = audiobook_titles[choice_index]
+                            print(f"Continuing with newly borrowed audiobook: '{selected_title}'")
+                        elif preselect_title:
+                            preselect_matches = [
+                                i for i, t in enumerate(audiobook_titles)
+                                if title_matches(preselect_title, t)
+                            ]
+                            if preselect_matches:
+                                choice_index = preselect_matches[0]
+                                selected_title = audiobook_titles[choice_index]
+                                print(f"Preselected via LIBBY_BOOK_TITLE={preselect_title!r}: '{selected_title}'")
+                            else:
+                                borrowed = explain_missing_audiobook(page, preselect_title)
+                                if not borrowed:
+                                    return
+                                if borrow_success_visible(page, borrowed):
+                                    opened_from_borrow_success = True
+                                    selected_title, selected_author = scrape_borrow_success_biblio(page)
+                                    if not selected_title:
+                                        selected_title = borrowed
+                                else:
+                                    audiobook_titles, audiobook_authors, tile_indices = collect_available_audiobook_loans(
+                                        page, downloaded_this_session
+                                    )
+                                    matches = [
+                                        i for i, t in enumerate(audiobook_titles)
+                                        if title_matches(borrowed, t)
+                                    ]
+                                    if not matches:
+                                        print("Borrow finished but the title did not appear as a loan.")
+                                        pause_browser_for_manual_borrow()
+                                        return
+                                    choice_index = matches[0]
+                                    selected_title = audiobook_titles[choice_index]
+                                print(f"Continuing with newly borrowed audiobook: '{selected_title}'")
+                        elif AUTO_SELECT_FIRST_AUDIOBOOK and len(audiobook_titles) == 1 and first_book:
+                            choice_index = 0
+                            selected_title = audiobook_titles[choice_index]
+                            print(f"Auto-selected the only audiobook on the shelf: '{selected_title}'")
+                        else:
+                            quit_requested = False
+                            while selected_title is None:
+                                try:
+                                    if downloaded_this_session:
+                                        prompt = "Enter the number of the audiobook to open (0 to quit): "
+                                    else:
+                                        prompt = "Enter the number of the audiobook to open: "
+                                    choice = input(prompt)
+                                    if downloaded_this_session and choice.strip().lower() in ('0', 'q', 'quit'):
+                                        quit_requested = True
+                                        break
+                                    choice_index = int(choice) - 1
+                                    if 0 <= choice_index < len(audiobook_titles):
+                                        selected_title = audiobook_titles[choice_index]
+                                        print(f"You selected: '{selected_title}'")
+                                    else:
+                                        print("Invalid choice. Please enter a number from the list.")
+                                except ValueError:
+                                    print("Invalid input. Please enter a number.")
+                                except EOFError:
+                                    print("(No interactive stdin; finishing.)")
+                                    quit_requested = True
+                                    break
+                            if quit_requested:
+                                break
+    
+                        if not opened_from_borrow_success:
+                            selected_tile = audiobook_loan_tiles(page).nth(tile_indices[choice_index])
+                            selected_author = (
+                                audiobook_authors[choice_index]
+                                if choice_index < len(audiobook_authors) else ''
+                            )
+                            if tile_is_hold(selected_tile):
+                                borrowed = explain_hold_not_borrowed(
+                                    selected_title, hold_status_from_tile(selected_tile), page=page
+                                )
+                                if not borrowed:
+                                    return
+                                if borrow_success_visible(page, borrowed):
+                                    opened_from_borrow_success = True
+                                    selected_title, selected_author = scrape_borrow_success_biblio(page)
+                                    if not selected_title:
+                                        selected_title = borrowed
+                                    selected_tile = None
+                                else:
+                                    audiobook_titles, audiobook_authors, tile_indices = collect_available_audiobook_loans(
+                                        page, downloaded_this_session
+                                    )
+                                    matches = [
+                                        i for i, t in enumerate(audiobook_titles)
+                                        if title_matches(borrowed, t)
+                                    ]
+                                    if not matches:
+                                        print("Borrow finished but the title did not appear as a loan.")
+                                        pause_browser_for_manual_borrow()
+                                        return
+                                    choice_index = matches[0]
+                                    selected_title = audiobook_titles[choice_index]
+                                    selected_author = (
+                                        audiobook_authors[choice_index]
+                                        if choice_index < len(audiobook_authors) else ''
+                                    )
+                                    selected_tile = audiobook_loan_tiles(page).nth(tile_indices[choice_index])
+    
+                    if opened_from_borrow_success:
+                        title_metadata = {
+                            'title': selected_title,
+                            'author_name': selected_author,
+                            'author_file_as': display_name_to_file_as(selected_author),
+                            'series_name': '',
+                            'series_index': '',
+                            'cover_url': '',
+                        }
+                    else:
+                        title_metadata = fetch_title_metadata(
+                            page,
+                            selected_tile,
+                            fallback_title=selected_title,
+                            fallback_author=selected_author,
+                        )
+    
+                    book_download_dir = build_book_download_dir(
+                        config['DOWNLOAD_DIRECTORY'],
+                        title_metadata,
+                        fallback_title=selected_title,
+                        fallback_author=selected_author,
+                    )
+                    print(f"Download directory for this book: {book_download_dir}")
+                    os.makedirs(book_download_dir, exist_ok=True)
+                    download_cover_image(title_metadata.get('cover_url'), book_download_dir)
+                    config['DOWNLOAD_DIRECTORY'] = book_download_dir
+                    book_folder_name = os.path.basename(book_download_dir)
+    
+                    if not click_open_audiobook(page, tile=selected_tile):
+                        borrowed = explain_hold_not_borrowed(
+                            selected_title, '', page=page
+                        )
+                        if not borrowed:
+                            pause_browser_for_manual_borrow()
+                            return
+                        if borrow_success_visible(page, borrowed):
+                            opened_from_borrow_success = True
+                            selected_title = borrowed
+                            selected_tile = None
+                        else:
+                            audiobook_titles, _ = collect_shelf_audiobook_loans(page)
+                            matches = [
+                                i for i, t in enumerate(audiobook_titles)
+                                if title_matches(borrowed, t)
+                            ]
+                            if not matches:
+                                print("Still no 'Open Audiobook' button after borrowing.")
+                                pause_browser_for_manual_borrow()
+                                return
+                            selected_tile = audiobook_loan_tiles(page).nth(matches[0])
+                        if not click_open_audiobook(page, tile=selected_tile):
+                            print("Still no 'Open Audiobook' button after borrowing.")
+                            pause_browser_for_manual_borrow()
+                            return
+                    try:
+                        page.wait_for_load_state('networkidle', timeout=PLAYWRIGHT_TIMEOUT_MS)
+                    except PlaywrightTimeoutError:
+                        pass  # Libby's SPA often never reaches networkidle; the player still loads
+                    time.sleep(3)
+                    filename = f"15_after_open_audiobook_button_{book_folder_name.replace(' ', '_')}.png"
+                    screenshot_path = os.path.join(config['DOWNLOAD_DIRECTORY'], filename)
+                    page.screenshot(path=screenshot_path)
+    
+                except PlaywrightTimeoutError as e:
+                    print(f"Error: Timed out while opening the selected audiobook on the shelf: {e}")
+                    return
+                except Exception as e:
+                    print(f"An error occurred while listing/selecting audiobooks: {e}")
+                    return
+    
+                print("Audiobook player opened. Rewinding to beginning...")
+                time.sleep(5)
+                save_snapshot(page, "player_opened")
+                screenshot_path = os.path.join(config['DOWNLOAD_DIRECTORY'], "16_after_audiobook_detail_load.png")
+                page.screenshot(path=screenshot_path)
+    
+                # Navigate to the beginning of the book so the forward pass starts from Part 1.
+                # Recording is gated to strict ascending order (see handle_request), so the
+                # resume position that loaded above was ignored; Part 1 will be the first part
+                # accepted once the rewind navigation triggers it.
+                global downloads_enabled, _latest_libby_part_number_trigger
+                try:
+                    player_frame_init = page.frame_locator('iframe[src*="listen.libbyapp.com"]')
+                    prev_btn = player_frame_init.locator('button[aria-label*="Previous Chapter"]')
+                    # Wait for the player to be ready before rewinding, keyed on the Next Chapter
+                    # button. That button is present throughout the book, whereas Previous Chapter
+                    # is hidden at the very start - so waiting on Previous Chapter would stall for
+                    # the full timeout whenever the book opens at/near the beginning.
+                    try:
+                        player_frame_init.locator('button[aria-label*="Next Chapter"]').first.wait_for(state='visible', timeout=PLAYWRIGHT_TIMEOUT_MS)
+                    except PlaywrightTimeoutError:
+                        print("Warning: player controls did not become visible within 60s; rewind may fail.")
+    
+                    # The initial auto-load (resume position + manifest traffic) is done. Enable
+                    # the handler now so the rewind navigation's Part 1 trigger is the first
+                    # thing captured - not the mid-book resume position that loaded above.
+                    downloads_enabled = True
+                    print("Rewind step reached: request handler enabled, capturing from Part 1 onward.")
+    
+                    # If Libby shows a "Recent place" history-back button pointing near the
+                    # start of the book, click it to jump straight there instead of stepping
+                    # back one chapter at a time.
+                    try:
+                        back_btn = player_frame_init.locator('button.history-bar-back-button')
+                        if back_btn.count() > 0 and back_btn.first.is_visible():
+                            place_text = back_btn.first.locator('.place-phrase-visual').first.text_content().strip()
+                            total_sec = 0
+                            for segment in place_text.split(':'):
+                                total_sec = total_sec * 60 + int(segment)
+                            if total_sec == 0:
+                                print(f"History-back button offers recent place {place_text}; jumping straight to it.")
+                                back_btn.first.click(timeout=3000)
+                                time.sleep(3)
+                            else:
+                                print(f"History-back button present but points to {place_text}; ignoring it.")
+                    except Exception as e:
+                        print(f"History-back shortcut not used: {e}")
+    
+                    for rewind_i in range(300):
                         try:
-                            player_fl.locator('button[aria-label*="Previous Chapter"]').first.click(timeout=2000)
+                            prev_btn.first.click(timeout=2000)
                             time.sleep(0.5)
                         except (PlaywrightTimeoutError, Exception):
+                            print(f"Reached beginning of book after {rewind_i} Previous Chapter clicks.")
                             break
                     time.sleep(3)
-
-                    print("  Scanning forward through all chapters...")
-                    for scan_i in range(100):
-                        remaining = [p for p in still_missing if p not in downloaded_parts]
-                        if not remaining:
-                            print(f"  All missing parts found after {scan_i} chapter scans!")
+                except Exception as e:
+                    print(f"Error rewinding to beginning: {e}")
+    
+                # --- Step 3: Player Control and Forward Part Discovery ---
+                initial_parts_count = len(downloaded_parts)
+                no_new_parts_count = 0
+                MAX_NO_NEW_PARTS_ITERATIONS = 10 # Stop if no new parts found for this many clicks
+                MAX_FORWARD_CLICKS = 500 # Safety limit for forward clicks
+    
+                MAX_SEEK_PROBES = 20          # Binary-search probes per missing part (resolution ~1/2^20 of the slider)
+                SEEK_TRIGGER_TIMEOUT_SEC = 12  # Max wait for a fresh part trigger after a seek probe (the player defers loading after rapid scrubs)
+                MAX_GAP_SKIP_CLICKS = 200     # Fallback 15s-skip budget floor when no seek slider is found
+                GAP_SKIP_WAIT_SEC = 2         # Wait after each seek/skip for the part trigger to fire
+    
+                for i in range(MAX_FORWARD_CLICKS):
+                    current_parts_count = len(downloaded_parts)
+                    expected_next_part = next_expected_part()  # Next part we still need, in order
+                    print(f"Forward pass iteration {i+1}. Current parts downloaded: {current_parts_count} (expect next part {expected_next_part})")
+    
+                    # Advance with the "Next Chapter" button only (aria-label match). This has
+                    # proven reliable; the old fallback selectors (chapter-bar-next-button,
+                    # 15s-skip, JS clicks) were removed because they stay present-but-hidden at
+                    # the end of the book and kept the loop "advancing" forever.
+                    player_frame = page.frame_locator('iframe[src*="listen.libbyapp.com"]')
+                    next_chapter_btn = player_frame.locator('button[aria-label*="Next Chapter"]')
+    
+                    # Log the button's state every iteration so its behaviour (especially at the
+                    # end of the book, where it becomes present-but-hidden) is always visible.
+                    nc_count = -1
+                    nc_visible = False
+                    nc_aria = None
+                    nc_bbox = None
+                    try:
+                        nc_count = next_chapter_btn.count()
+                        if nc_count > 0:
+                            first_btn = next_chapter_btn.first
+                            nc_visible = first_btn.is_visible()
+                            nc_aria = first_btn.get_attribute('aria-label')
+                            nc_bbox = first_btn.bounding_box()
+                    except Exception as e:
+                        print(f"  [next-chapter] error reading button metadata: {e}")
+                    print(f"  [next-chapter] count={nc_count} visible={nc_visible} aria-label={nc_aria!r} bbox={nc_bbox}")
+    
+                    # End of book: the Next Chapter button is gone or no longer visible (it stays
+                    # in the DOM but hidden on the last chapter). Playback never reaches the true
+                    # audio end via chapter skips, so this - not the play button's "The End"
+                    # text - is our stop signal.
+                    if nc_count == 0 or not nc_visible:
+                        print("End of book detected: 'Next Chapter' button is not present/visible. Stopping forward pass.")
+                        save_snapshot(page, "end_of_book")
+                        break
+    
+                    button_found = False
+                    try:
+                        next_chapter_btn.first.click(timeout=2000)
+                        print("  Clicked Next Chapter.")
+                        button_found = True
+                        time.sleep(5)
+                    except (PlaywrightTimeoutError, Exception) as e:
+                        print(f"  Next Chapter click failed despite being visible: {e}")
+                        break # Treat an unclickable button as end of book
+    
+                    # Gap recovery: chapters can span multiple audio parts, so a Next
+                    # Chapter jump can skip over the start of a part entirely (e.g. it lands
+                    # on Part 6 while Part 5 was never played). Because recording is gated to
+                    # ascending order, the skipped part simply never got accepted: the next
+                    # expected part is still missing even though we've now seen a higher part.
+                    # When that happens, step back chapter-by-chapter until the player is
+                    # positioned BEFORE the missing part, then advance in 15s steps; each
+                    # skipped part triggers in order and is accepted as we pass through it.
+                    if button_found:
+                        time.sleep(2)  # let the part trigger from the chapter jump arrive
+                        landed = _last_seen_part  # highest part the player has reached so far
+                        missing_part = expected_next_part
+                        if landed > missing_part:
+                            print(f"Gap detected: player reached Part {landed} but Part {missing_part} was skipped. Stepping back to before Part {missing_part}...")
+                            save_snapshot(page, f"gap_recovery_part{missing_part}")
+                            player_frame = page.frame_locator('iframe[src*="listen.libbyapp.com"]')
+                            # We're sitting at the overshoot chapter's start right now: the
+                            # missing part's boundary lies BEFORE this tape position. Record it
+                            # as the upper bound for the seek search below.
+                            gap_hi_px = tape_position_px(player_frame)
+                            prev_chapter_btn = player_frame.locator('button[aria-label*="Previous Chapter"]')
+    
+                            # Step back one chapter at a time until the player lands on a part
+                            # earlier than the one we're missing (a single chapter back is often
+                            # not enough - the skipped part can start several chapters earlier).
+                            MAX_BACK_CHAPTERS = 15
+                            back_clicks = 0
+                            while back_clicks < MAX_BACK_CHAPTERS:
+                                try:
+                                    prev_chapter_btn.first.click(timeout=3000)
+                                except (PlaywrightTimeoutError, Exception) as e:
+                                    print(f"  Reached start of book while stepping back ({e}).")
+                                    break
+                                back_clicks += 1
+                                time.sleep(2)
+                                if _last_seen_part and _last_seen_part < missing_part:
+                                    print(f"  Stepped back {back_clicks} chapter(s) to Part {_last_seen_part}; now scanning forward for Part {missing_part}.")
+                                    break
+                            else:
+                                print(f"  Stepped back {back_clicks} chapters (cap reached); scanning forward from here.")
+    
+                            # Binary-search the seekometer tape for the missing part(s).
+                            # The tape is time-linear over the whole book (2px/sec), so seeking
+                            # to a tape position triggers that position's part request, and
+                            # position -> part number is monotonic: each probe halves the
+                            # interval. The order gate reads out the result: overshoot probes
+                            # are ignored, and the probe that lands inside the target part is
+                            # the expected one, so it's accepted and downloads.
+                            # Search between here (known to be in a part < target after the
+                            # step-back) and the overshoot chapter's start captured above.
+                            lo = tape_position_px(player_frame)
+                            hi = gap_hi_px
+                            if hi is None:
+                                try:
+                                    tape_w = player_frame.locator('.seekometer-tape').first.evaluate("el => el.getBoundingClientRect().width")
+                                    hi = float(tape_w)
+                                except Exception as e:
+                                    print(f"  [tape-seek] could not read tape width ({e})")
+                            seek_ok = lo is not None and hi is not None and hi > lo
+                            if not seek_ok:
+                                print(f"  [seek-search] no usable tape bounds (lo={lo}, hi={hi}); falling back to 15s skips.")
+                            if seek_ok:
+                                while next_expected_part() < landed and seek_ok:
+                                    target = next_expected_part()
+                                    s_lo, s_hi = lo, hi
+                                    probes = 0
+                                    while probes < MAX_SEEK_PROBES and next_expected_part() == target:
+                                        if s_hi - s_lo < 30:  # interval down to ~15s of audio; boundary pinned
+                                            print(f"  [seek-search] interval collapsed to {s_hi - s_lo:.0f}px without capturing Part {target}.")
+                                            break
+                                        mid = (s_lo + s_hi) / 2.0
+                                        seq_before = _trigger_seq
+                                        landed_px = seek_tape_to_px(page, player_frame, mid)
+                                        if landed_px is None:
+                                            print("  [seek-search] tape drag failed; falling back to 15s skips.")
+                                            seek_ok = False
+                                            break
+                                        probes += 1
+                                        # Wait for a FRESH trigger from this seek before classifying
+                                        # the probe - a fixed short sleep can read a stale part number
+                                        # and misclassify. Seeks within the already-loaded part fire
+                                        # no new trigger, so on timeout the stale value IS correct.
+                                        probe_deadline = time.time() + SEEK_TRIGGER_TIMEOUT_SEC
+                                        while time.time() < probe_deadline and _trigger_seq == seq_before:
+                                            time.sleep(0.25)
+                                        fresh = _trigger_seq != seq_before
+                                        if fresh:
+                                            # Scrubbing fires triggers for parts merely passed over.
+                                            # Wait for the stream to go quiet (2s) so we read the
+                                            # trigger belonging to the tape's resting position.
+                                            last_seq = _trigger_seq
+                                            quiet_since = time.time()
+                                            settle_deadline = time.time() + 8
+                                            while time.time() < settle_deadline and (time.time() - quiet_since) < 2.0:
+                                                time.sleep(0.25)
+                                                if _trigger_seq != last_seq:
+                                                    last_seq = _trigger_seq
+                                                    quiet_since = time.time()
+                                        cur = _last_seen_part
+                                        # Classify against where the tape actually SETTLED, not the
+                                        # requested midpoint - drags aren't pixel-accurate and the
+                                        # tape can drift after release; narrowing by the wrong
+                                        # coordinate corrupts the interval.
+                                        settled_px = tape_position_px(player_frame)
+                                        if settled_px is None:
+                                            settled_px = landed_px
+                                        print(f"  [seek-search] probe {probes}/{MAX_SEEK_PROBES}: tape_px={settled_px:.0f} (~{settled_px / TAPE_PX_PER_SEC / 60:.1f} min) -> part {cur} ({'fresh trigger' if fresh else 'no new trigger'}, target {target})")
+                                        if cur < target:
+                                            s_lo = max(s_lo, settled_px)
+                                        elif cur > target:
+                                            s_hi = min(s_hi, settled_px)
+                                    if not seek_ok:
+                                        break
+                                    if next_expected_part() == target:
+                                        print(f"  Seek search could not trigger Part {target} in {probes} probes; falling back to 15s skips.")
+                                        break
+                                    print(f"  Seek search captured Part {target} in {probes} probes.")
+                                    lo = tape_position_px(player_frame) or lo  # continue from here for the next missing part
+    
+                            # Fallback when no slider was found or the search stalled: play
+                            # through the chapter in 15s steps, budgeted from the chapter length
+                            # in the Next Chapter label ("Next Chapter . 88 minutes ahead.").
+                            if next_expected_part() < landed:
+                                skip_budget = MAX_GAP_SKIP_CLICKS
+                                try:
+                                    label = player_frame.locator('button[aria-label*="Next Chapter"]').first.get_attribute('aria-label') or ""
+                                    hours_m = re.search(r'(\d+)\s*hour', label)
+                                    minutes_m = re.search(r'(\d+)\s*minute', label)
+                                    total_min = (int(hours_m.group(1)) * 60 if hours_m else 0) + (int(minutes_m.group(1)) if minutes_m else 0)
+                                    if total_min:
+                                        skip_budget = max(skip_budget, (total_min * 60) // 15 + 20)
+                                        print(f"  Chapter ahead is ~{total_min} min of audio; skip budget set to {skip_budget}.")
+                                except Exception as e:
+                                    print(f"  Could not read chapter length for skip budget ({e}); using default {skip_budget}.")
+    
+                                skip_btn = player_frame.locator('button[aria-label*="Advance 15 seconds"], button.mini-player-jump-ahead')
+                                skip_clicks = 0
+                                while next_expected_part() < landed and skip_clicks < skip_budget:
+                                    try:
+                                        skip_btn.first.click(timeout=3000)
+                                    except (PlaywrightTimeoutError, Exception) as e:
+                                        print(f"  15s advance failed during gap recovery: {e}")
+                                        break
+                                    skip_clicks += 1
+                                    time.sleep(GAP_SKIP_WAIT_SEC)
+                                    if skip_clicks % 20 == 0:
+                                        print(f"  Gap recovery: {skip_clicks}/{skip_budget} skips so far, next still-missing part is {next_expected_part()} (filling up to {landed - 1})")
+    
+                            if next_expected_part() < landed:
+                                print(f"  Gap recovery gave up; Part {next_expected_part()} still missing (Step 4 will retry).")
+                            else:
+                                print(f"  Gap recovery done; parts up to {landed - 1} captured. Resuming chapter skips to reach Part {landed}.")
+    
+                            # An accepted trigger only marks the part; the browser's CDN audio
+                            # fetch is still in flight. Clicking Next Chapter now can abort that
+                            # fetch ("No Playwright response object"), losing the part until the
+                            # Step 4 retry. Let pending downloads settle before navigating away.
+                            pending = []
+                            wait_deadline = time.time() + 20
+                            while time.time() < wait_deadline:
+                                with active_downloads_lock:
+                                    pending = sorted(p for p in found_parts if p not in downloaded_parts)
+                                if not pending:
+                                    break
+                                time.sleep(1)
+                            if pending:
+                                print(f"  Warning: recovered part(s) {pending} still not downloaded after 20s; Step 4 will retry them.")
+    
+                    if len(downloaded_parts) == current_parts_count:
+                        no_new_parts_count += 1
+                        print(f"No new parts detected in this iteration ({no_new_parts_count}/{MAX_NO_NEW_PARTS_ITERATIONS}).")
+                        if no_new_parts_count >= MAX_NO_NEW_PARTS_ITERATIONS:
+                            print("Stopping forward pass: No new parts found for several iterations.")
                             break
-                        try:
-                            player_fl.locator('button[aria-label*="Next Chapter"]').first.click(timeout=3000)
-                            time.sleep(3)
-                            newly_found = [p for p in still_missing if p in downloaded_parts and p not in found_parts]
-                        except (PlaywrightTimeoutError, Exception):
-                            print(f"  End of book reached after {scan_i} chapter scans.")
-                            break
-
-                    final_missing = [p for p in missing_parts if p not in downloaded_parts]
-                    if final_missing:
-                        print(f"  Parts still missing after full scan: {final_missing}")
                     else:
-                        print(f"  All parts successfully retrieved!")
+                        no_new_parts_count = 0 # Reset counter if new parts were found
+    
+                print(f"Forward pass complete. Total unique parts found: {len(downloaded_parts)}")
+                print(f"Highest part number downloaded: {max_part_number_found}; highest part number seen in any trigger: {max_part_number_seen}")
+    
+                # --- Wait for all active downloads to complete before proceeding ---
+                print("Waiting for all active downloads to complete...")
+                while True:
+                    with active_downloads_lock:
+                        current_active = active_downloads_count
+                    if current_active == 0:
+                        print("All downloads appear to be complete.")
+                        break
+                    print(f"Still {current_active} downloads active. Waiting...")
+                    time.sleep(5) # Wait a bit before checking again
+    
+                # --- Step 4: Retrieve Missing Parts via Signed URL Extraction ---
+                print("Checking for any missing parts and attempting to retrieve them...")
+                # Range over the highest part SEEN, not just downloaded: parts skipped by
+                # chapter jumps were never accepted, so max_part_number_found alone would
+                # undercount and silently declare success with parts missing (e.g. a run
+                # that downloaded 1-8 but saw triggers for 11 is missing 9-11, not "done").
+                highest_known_part = max(max_part_number_found, max_part_number_seen)
+                missing_parts = []
+                for i in range(1, highest_known_part + 1):
+                    if i not in downloaded_parts:
+                        missing_parts.append(i)
+    
+                if not missing_parts:
+                    print("No missing parts detected. All parts downloaded successfully!")
+                else:
+                    print(f"Missing parts identified: {sorted(missing_parts)}")
+    
+                    # These parts' triggers were accepted during the forward pass, but the
+                    # audio download never completed. The order gate in handle_request keys
+                    # on found_parts, so unless we evict them it would reject every re-trigger
+                    # as out-of-order (expecting a part past the end of the book) and the
+                    # retries below could never succeed.
+                    with active_downloads_lock:
+                        for p in missing_parts:
+                            found_parts.discard(p)
+                        _latest_libby_part_number_trigger = None
+    
+                    player_frame_obj = None
+                    for frame in page.frames:
+                        if 'listen.libbyapp.com' in frame.url:
+                            player_frame_obj = frame
+                            break
+    
+                    # Try to extract all signed spine URLs from the player's JavaScript
+                    if player_frame_obj and len(_signed_spine_urls) < highest_known_part:
+                        print("Extracting signed spine URLs from player...")
+                        try:
+                            spine_data = player_frame_obj.evaluate(r"""
+                                () => {
+                                    try {
+                                        var results = {};
+                                        var scripts = document.querySelectorAll('script');
+                                        for (var s of scripts) {
+                                            var text = s.textContent || '';
+                                            var matches = text.matchAll(/Part(\d+)\.mp3\?cmpt=([A-Za-z0-9+\/=%]+--[a-f0-9]+)/g);
+                                            for (var m of matches) {
+                                                results[parseInt(m[1])] = m[2];
+                                            }
+                                        }
+                                        function searchObj(obj, depth) {
+                                            if (depth > 3 || !obj) return;
+                                            try {
+                                                if (typeof obj === 'string' && obj.includes('cmpt=') && obj.includes('Part')) {
+                                                    var m = obj.match(/Part(\d+)\.mp3\?cmpt=([A-Za-z0-9+\/=%]+--[a-f0-9]+)/);
+                                                    if (m) results[parseInt(m[1])] = m[2];
+                                                }
+                                                if (typeof obj === 'object') {
+                                                    for (var k in obj) {
+                                                        try { searchObj(obj[k], depth + 1); } catch(e) {}
+                                                    }
+                                                }
+                                            } catch(e) {}
+                                        }
+                                        try { searchObj(window.__NEXT_DATA__, 0); } catch(e) {}
+                                        try { searchObj(window.__STATE__, 0); } catch(e) {}
+                                        try { searchObj(window.roster, 0); } catch(e) {}
+                                        return {found: Object.keys(results).length, urls: results};
+                                    } catch(e) {
+                                        return {error: e.message, found: 0, urls: {}};
+                                    }
+                                }
+                            """)
+                            print(f"  Spine URL extraction: found {spine_data.get('found', 0)} signed URLs")
+                            if spine_data.get('urls'):
+                                for part_str, cmpt in spine_data['urls'].items():
+                                    part_num = int(part_str)
+                                    if part_num not in _signed_spine_urls and _libby_url_template:
+                                        full_url = f"{_libby_url_template}Part{part_num:02d}.mp3?cmpt={cmpt}"
+                                        _signed_spine_urls[part_num] = full_url
+                        except Exception as e:
+                            print(f"  Spine URL extraction failed: {e}")
+    
+                    for missing_part in sorted(missing_parts):
+                        if missing_part in downloaded_parts:
+                            continue
+                        print(f"Attempting to retrieve missing Part {missing_part} (spine {missing_part - 1})...")
+    
+                        # Method 1: Use stored signed URL if available
+                        if missing_part in _signed_spine_urls and missing_part not in downloaded_parts:
+                            signed_url = _signed_spine_urls[missing_part]
+                            print(f"  Using signed URL for Part {missing_part}...")
+                            try:
+                                if player_frame_obj:
+                                    player_frame_obj.evaluate("""
+                                        (url) => {
+                                            var audio = new Audio();
+                                            audio.src = url;
+                                            audio.load();
+                                        }
+                                    """, signed_url)
+                                    time.sleep(8)
+                            except Exception as e:
+                                print(f"  Signed URL fetch failed: {e}")
+    
+                        if missing_part in downloaded_parts:
+                            print(f"  Successfully retrieved Part {missing_part}!")
+                        else:
+                            print(f"  Failed to retrieve Part {missing_part}.")
+    
+                    # Method 2: Systematic forward scan from beginning for remaining missing parts
+                    still_missing = [p for p in missing_parts if p not in downloaded_parts]
+                    if still_missing:
+                        print(f"\nSystematic scan for {len(still_missing)} remaining missing parts: {still_missing}")
+                        player_fl = page.frame_locator('iframe[src*="listen.libbyapp.com"]')
+    
+                        print("  Rewinding to beginning...")
+                        for _ in range(50):
+                            try:
+                                player_fl.locator('button[aria-label*="Previous Chapter"]').first.click(timeout=2000)
+                                time.sleep(0.5)
+                            except (PlaywrightTimeoutError, Exception):
+                                break
+                        time.sleep(3)
+    
+                        print("  Scanning forward through all chapters...")
+                        for scan_i in range(100):
+                            remaining = [p for p in still_missing if p not in downloaded_parts]
+                            if not remaining:
+                                print(f"  All missing parts found after {scan_i} chapter scans!")
+                                break
+                            try:
+                                player_fl.locator('button[aria-label*="Next Chapter"]').first.click(timeout=3000)
+                                time.sleep(3)
+                                newly_found = [p for p in still_missing if p in downloaded_parts and p not in found_parts]
+                            except (PlaywrightTimeoutError, Exception):
+                                print(f"  End of book reached after {scan_i} chapter scans.")
+                                break
+    
+                        final_missing = [p for p in missing_parts if p not in downloaded_parts]
+                        if final_missing:
+                            print(f"  Parts still missing after full scan: {final_missing}")
+                        else:
+                            print(f"  All parts successfully retrieved!")
+    
+                print("All download attempts complete.")
+    
+                downloaded_files = sorted(
+                    f for f in os.listdir(book_download_dir)
+                    if f.lower().endswith('.mp3')
+                )
+                title_display = title_metadata.get('title') or selected_title
+                author_display = title_metadata.get('author_name') or selected_author
+                print(f"\nDownloaded \"{title_display}\" by {author_display} ({len(downloaded_files)} parts) to: {book_download_dir}")
 
-            print("All download attempts complete.")
+                downloaded_this_session.append(title_display)
+                reset_download_state()
+                config['DOWNLOAD_DIRECTORY'] = base_download_dir
 
-            downloaded_files = sorted(
-                f for f in os.listdir(book_download_dir)
-                if f.lower().endswith('.mp3')
-            )
-            title_display = title_metadata.get('title') or selected_title
-            author_display = title_metadata.get('author_name') or selected_author
-            print(f"\nDownloaded \"{title_display}\" by {author_display} ({len(downloaded_files)} parts) to: {book_download_dir}")
+                if not navigate_to_shelf(page, base_download_dir):
+                    break
+
 
         except PlaywrightTimeoutError as e:
             print(f"Playwright operation timed out: {e}. This often means a selector was not found or a page took too long to load.")
