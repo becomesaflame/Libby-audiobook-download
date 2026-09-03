@@ -106,11 +106,33 @@ def title_already_downloaded(title, downloaded_titles):
     return any(title_matches(title, done) for done in downloaded_titles)
 
 
+def close_audiobook_player(page):
+    """Leave the listen.libbyapp.com player via its Back / Close Audiobook control."""
+    try:
+        player = page.frame_locator('iframe[src*="listen.libbyapp.com"]')
+        back_btn = player.locator('button.client-back-button')
+        if back_btn.count() == 0 or not back_btn.first.is_visible():
+            return False
+        print("Closing audiobook player...")
+        back_btn.first.click(timeout=PLAYWRIGHT_TIMEOUT_MS)
+        try:
+            page.wait_for_load_state('networkidle', timeout=PLAYWRIGHT_TIMEOUT_MS)
+        except PlaywrightTimeoutError:
+            pass
+        time.sleep(2)
+        return True
+    except Exception as e:
+        print(f"Could not close audiobook player: {e}")
+        return False
+
+
 def navigate_to_shelf(page, screenshot_dir=None):
-    """Open the shelf tab and wait for loan tiles to appear."""
+    """Leave the player if open, then open the shelf tab and wait for loan tiles."""
     print("Returning to shelf...")
     try:
-        page.click('#footer-nav-shelf')
+        # Footer nav is behind the player iframe and not clickable until Back is pressed.
+        close_audiobook_player(page)
+        page.click('#footer-nav-shelf', timeout=PLAYWRIGHT_TIMEOUT_MS)
         try:
             page.wait_for_load_state('networkidle', timeout=PLAYWRIGHT_TIMEOUT_MS)
         except PlaywrightTimeoutError:
@@ -123,9 +145,11 @@ def navigate_to_shelf(page, screenshot_dir=None):
         return True
     except PlaywrightTimeoutError:
         print("Error: Could not return to the shelf.")
+        save_snapshot(page, "shelf_return_failed")
         return False
     except Exception as e:
         print(f"Error returning to shelf: {e}")
+        save_snapshot(page, "shelf_return_failed")
         return False
 
 
