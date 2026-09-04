@@ -2,6 +2,7 @@ import os
 import re
 import sys
 import time
+import base64
 import requests
 import json # Import the json library for config file handling
 import threading # Import threading for the lock
@@ -180,6 +181,13 @@ def save_snapshot(page, name):
 # (translate3d(-<px>, 0, 0)) is the playhead position, and dragging the tape
 # left/right seeks. See snapshots/*_player_iframe.html for the captured DOM.
 TAPE_PX_PER_SEC = 2.0
+# At the last chapter Libby relabels Previous/Next to these; match both.
+PREV_CHAPTER_SELECTOR = 'button[aria-label*="Previous Chapter"], button[aria-label*="Start Of Chapter"]'
+ADVANCE_15_SELECTOR = 'button[aria-label*="Advance 15 seconds"], button.mini-player-jump-ahead'
+REWIND_15_SELECTOR = 'button[aria-label*="Rewind 15 seconds"], button.mini-player-jump-behind'
+# Tape-search snaps with ~30s tolerance and will skip a part shorter than that.
+# Sequential 15s steps are more reliable for short end-matter gaps.
+SMALL_GAP_PX = 5 * 60 * TAPE_PX_PER_SEC
 
 
 def tape_position_px(player_frame):
@@ -251,6 +259,165 @@ def seek_tape_to_px(page, player_frame, target_px):
             return None
         time.sleep(0.8)  # tape has a 500ms ease-out transition
     return cur
+
+
+def click_first_visible(player_frame, selector, timeout=3000):
+    """Click the first visible button matching selector, or raise TimeoutError."""
+    loc = player_frame.locator(selector)
+    deadline = time.time() + timeout / 1000.0
+    last_err = None
+    while time.time() < deadline:
+        try:
+            count = loc.count()
+        except Exception as e:
+            last_err = e
+            time.sleep(0.1)
+            continue
+        for i in range(count):
+            btn = loc.nth(i)
+            try:
+                if btn.is_visible():
+                    btn.click(timeout=timeout)
+                    return
+            except Exception as e:
+                last_err = e
+        time.sleep(0.1)
+    raise PlaywrightTimeoutError(f"No visible button matching {selector!r} ({last_err})")
+
+
+def click_prev_chapter(player_frame, timeout=3000):
+    """Step back a chapter, including the last-chapter 'Start Of Chapter' label."""
+    click_first_visible(player_frame, PREV_CHAPTER_SELECTOR, timeout=timeout)
+
+
+def _save_downloaded_part_bytes(part_number, body):
+    """Write part bytes to disk and mark the part found+downloaded. Returns True on success."""
+    global downloaded_parts, found_parts, max_part_number_found
+    if not body or len(body) < 1000:
+        print(f"  Direct fetch of Part {part_number} returned {0 if not body else len(body)} bytes")
+        return False
+    stripped = body.lstrip()
+    if stripped.startswith(b'<') or stripped.startswith(b'{'):
+        print(f"  Direct fetch of Part {part_number} did not return audio")
+        return False
+    file_name = f"Part_{part_number:02d}.mp3"
+    file_path = os.path.join(config['DOWNLOAD_DIRECTORY'], file_name)
+    if os.path.exists(file_path) and len(body) < os.path.getsize(file_path):
+        print(f"  Skipping {file_name}: already have larger file ({os.path.getsize(file_path)} bytes)")
+        with active_downloads_lock:
+            downloaded_parts.add(part_number)
+            found_parts.add(part_number)
+            max_part_number_found = max(max_part_number_found, part_number)
+        return True
+    with open(file_path, "wb") as f:
+        f.write(body)
+    with active_downloads_lock:
+        downloaded_parts.add(part_number)
+        found_parts.add(part_number)
+        max_part_number_found = max(max_part_number_found, part_number)
+    print(f"  Directly downloaded {file_name} ({len(body)} bytes)")
+    return True
+
+
+def download_part_from_signed_url(page, part_number, signed_url):
+    """Save a part by fetching its signed Libby URL.
+
+    Audio().load() is a no-op when the player already buffered that part (the
+    usual situation at The End), and the order gate would reject an out-of-order
+    re-trigger anyway. Fetch from the player iframe first so we have its
+    cookies; fall back to the Playwright request context.
+    """
+    player_frame_obj = None
+    for frame in page.frames:
+        if 'listen.libbyapp.com' in frame.url:
+            player_frame_obj = frame
+            break
+    if player_frame_obj:
+        try:
+            result = player_frame_obj.evaluate(
+                """
+                async (url) => {
+                    const r = await fetch(url);
+                    if (!r.ok && r.status !== 206) return {status: r.status};
+                    const buf = await r.arrayBuffer();
+                    const bytes = new Uint8Array(buf);
+                    let binary = '';
+                    const chunk = 0x8000;
+                    for (let i = 0; i < bytes.length; i += chunk) {
+                        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+                    }
+                    return {status: r.status, b64: btoa(binary)};
+                }
+                """,
+                signed_url,
+            )
+            if result and result.get('b64'):
+                return _save_downloaded_part_bytes(part_number, base64.b64decode(result['b64']))
+            print(f"  Iframe fetch of Part {part_number} returned HTTP {result.get('status') if result else 'no result'}")
+        except Exception as e:
+            print(f"  Iframe fetch of Part {part_number} failed: {e}")
+    try:
+        response = page.request.get(signed_url, timeout=60000, headers={"Range": "bytes=0-"})
+    except Exception as e:
+        print(f"  Direct fetch of Part {part_number} failed: {e}")
+        return False
+    if response.status not in (200, 206):
+        print(f"  Direct fetch of Part {part_number} returned HTTP {response.status}")
+        return False
+    return _save_downloaded_part_bytes(part_number, response.body())
+
+
+def fill_gap_with_15s_skips(page, player_frame, landed_part, lo_px=None, skip_budget=200, wait_sec=2):
+    """Walk 15s at a time through a skipped-part gap.
+
+    Chapter jumps and tape-search skip tiny parts, especially in the last
+    minutes of a book. Sequential 15s steps make the player request each part
+    in order. If the playhead is already PAST the missing part (The End /
+    Closing), rewind first — advancing from 100% is a no-op.
+    """
+    target = next_expected_part()
+    if target >= landed_part:
+        return
+
+    past_gap = (not _last_seen_part) or (_last_seen_part >= target)
+    if past_gap:
+        restored = False
+        if lo_px is not None:
+            print(f"  Restoring tape to {lo_px:.0f}px (before Part {target}) before 15s walk.")
+            if seek_tape_to_px(page, player_frame, lo_px) is not None:
+                time.sleep(wait_sec)
+                if _last_seen_part and _last_seen_part < target:
+                    restored = True
+        if not restored:
+            print(f"  Playhead is in Part {_last_seen_part}; rewinding 15s toward Part {target}.")
+            for i in range(skip_budget):
+                if _last_seen_part and _last_seen_part < target:
+                    print(f"  Rewound to Part {_last_seen_part} after {i} skips.")
+                    break
+                try:
+                    click_first_visible(player_frame, REWIND_15_SELECTOR, timeout=3000)
+                except (PlaywrightTimeoutError, Exception) as e:
+                    print(f"  15s rewind failed: {e}")
+                    break
+                time.sleep(wait_sec)
+                if (i + 1) % 20 == 0:
+                    print(f"  Gap rewind: {i + 1}/{skip_budget}, last seen Part {_last_seen_part}, still need {next_expected_part()}")
+            else:
+                print(f"  Rewind budget exhausted; last seen Part {_last_seen_part}.")
+
+    if next_expected_part() >= landed_part:
+        return
+    skip_clicks = 0
+    while next_expected_part() < landed_part and skip_clicks < skip_budget:
+        try:
+            click_first_visible(player_frame, ADVANCE_15_SELECTOR, timeout=3000)
+        except (PlaywrightTimeoutError, Exception) as e:
+            print(f"  15s advance failed during gap recovery: {e}")
+            break
+        skip_clicks += 1
+        time.sleep(wait_sec)
+        if skip_clicks % 20 == 0:
+            print(f"  Gap recovery: {skip_clicks}/{skip_budget} skips so far, next still-missing part is {next_expected_part()} (filling up to {landed_part - 1})")
 
 # --- Configuration Management Functions ---
 def load_config():
@@ -1883,7 +2050,6 @@ def run():
                 global downloads_enabled, _latest_libby_part_number_trigger
                 try:
                     player_frame_init = page.frame_locator('iframe[src*="listen.libbyapp.com"]')
-                    prev_btn = player_frame_init.locator('button[aria-label*="Previous Chapter"]')
                     # Wait for the player to be ready before rewinding, keyed on the Next Chapter
                     # button. That button is present throughout the book, whereas Previous Chapter
                     # is hidden at the very start - so waiting on Previous Chapter would stall for
@@ -1920,7 +2086,7 @@ def run():
     
                     for rewind_i in range(300):
                         try:
-                            prev_btn.first.click(timeout=2000)
+                            click_prev_chapter(player_frame_init, timeout=2000)
                             time.sleep(0.5)
                         except (PlaywrightTimeoutError, Exception):
                             print(f"Reached beginning of book after {rewind_i} Previous Chapter clicks.")
@@ -2008,7 +2174,6 @@ def run():
                             # missing part's boundary lies BEFORE this tape position. Record it
                             # as the upper bound for the seek search below.
                             gap_hi_px = tape_position_px(player_frame)
-                            prev_chapter_btn = player_frame.locator('button[aria-label*="Previous Chapter"]')
     
                             # Step back one chapter at a time until the player lands on a part
                             # earlier than the one we're missing (a single chapter back is often
@@ -2017,7 +2182,7 @@ def run():
                             back_clicks = 0
                             while back_clicks < MAX_BACK_CHAPTERS:
                                 try:
-                                    prev_chapter_btn.first.click(timeout=3000)
+                                    click_prev_chapter(player_frame, timeout=3000)
                                 except (PlaywrightTimeoutError, Exception) as e:
                                     print(f"  Reached start of book while stepping back ({e}).")
                                     break
@@ -2046,9 +2211,15 @@ def run():
                                     hi = float(tape_w)
                                 except Exception as e:
                                     print(f"  [tape-seek] could not read tape width ({e})")
-                            seek_ok = lo is not None and hi is not None and hi > lo
+                            gap_px = (hi - lo) if (lo is not None and hi is not None and hi > lo) else None
+                            seek_ok = gap_px is not None
                             if not seek_ok:
                                 print(f"  [seek-search] no usable tape bounds (lo={lo}, hi={hi}); falling back to 15s skips.")
+                            elif gap_px < SMALL_GAP_PX:
+                                # Tape-search snaps ~30s and will skip a part shorter than that
+                                # (end-matter like Author/Notes/Closing is often only 1-2 min total).
+                                print(f"  Gap is only {gap_px / TAPE_PX_PER_SEC:.0f}s of audio; walking 15s instead of tape-searching.")
+                                seek_ok = False
                             if seek_ok:
                                 while next_expected_part() < landed and seek_ok:
                                     target = next_expected_part()
@@ -2107,34 +2278,30 @@ def run():
                                     print(f"  Seek search captured Part {target} in {probes} probes.")
                                     lo = tape_position_px(player_frame) or lo  # continue from here for the next missing part
     
-                            # Fallback when no slider was found or the search stalled: play
-                            # through the chapter in 15s steps, budgeted from the chapter length
-                            # in the Next Chapter label ("Next Chapter . 88 minutes ahead.").
+                            # Fallback when no slider was found, the gap is tiny, or the search
+                            # stalled: walk 15s through the gap. Rewind first if the playhead
+                            # is already past the missing part (advancing from 100% is a no-op).
                             if next_expected_part() < landed:
                                 skip_budget = MAX_GAP_SKIP_CLICKS
                                 try:
-                                    label = player_frame.locator('button[aria-label*="Next Chapter"]').first.get_attribute('aria-label') or ""
+                                    nc = player_frame.locator('button[aria-label*="Next Chapter"]').first
+                                    label = ""
+                                    if nc.count() > 0 and nc.is_visible():
+                                        label = nc.get_attribute('aria-label') or ""
                                     hours_m = re.search(r'(\d+)\s*hour', label)
                                     minutes_m = re.search(r'(\d+)\s*minute', label)
                                     total_min = (int(hours_m.group(1)) * 60 if hours_m else 0) + (int(minutes_m.group(1)) if minutes_m else 0)
                                     if total_min:
                                         skip_budget = max(skip_budget, (total_min * 60) // 15 + 20)
                                         print(f"  Chapter ahead is ~{total_min} min of audio; skip budget set to {skip_budget}.")
-                                except Exception as e:
-                                    print(f"  Could not read chapter length for skip budget ({e}); using default {skip_budget}.")
-    
-                                skip_btn = player_frame.locator('button[aria-label*="Advance 15 seconds"], button.mini-player-jump-ahead')
-                                skip_clicks = 0
-                                while next_expected_part() < landed and skip_clicks < skip_budget:
-                                    try:
-                                        skip_btn.first.click(timeout=3000)
-                                    except (PlaywrightTimeoutError, Exception) as e:
-                                        print(f"  15s advance failed during gap recovery: {e}")
-                                        break
-                                    skip_clicks += 1
-                                    time.sleep(GAP_SKIP_WAIT_SEC)
-                                    if skip_clicks % 20 == 0:
-                                        print(f"  Gap recovery: {skip_clicks}/{skip_budget} skips so far, next still-missing part is {next_expected_part()} (filling up to {landed - 1})")
+                                except Exception:
+                                    pass
+                                if gap_px:
+                                    skip_budget = max(skip_budget, int(gap_px / TAPE_PX_PER_SEC / 15) + 40)
+                                fill_gap_with_15s_skips(
+                                    page, player_frame, landed,
+                                    lo_px=lo, skip_budget=skip_budget, wait_sec=GAP_SKIP_WAIT_SEC,
+                                )
     
                             if next_expected_part() < landed:
                                 print(f"  Gap recovery gave up; Part {next_expected_part()} still missing (Step 4 will retry).")
@@ -2266,60 +2433,34 @@ def run():
                             continue
                         print(f"Attempting to retrieve missing Part {missing_part} (spine {missing_part - 1})...")
     
-                        # Method 1: Use stored signed URL if available
+                        # Method 1: Fetch the signed URL directly. Audio().load() is a no-op
+                        # when the player already buffered this part (typical at The End),
+                        # and the order gate would reject an out-of-order re-trigger.
                         if missing_part in _signed_spine_urls and missing_part not in downloaded_parts:
                             signed_url = _signed_spine_urls[missing_part]
                             print(f"  Using signed URL for Part {missing_part}...")
-                            try:
-                                if player_frame_obj:
-                                    player_frame_obj.evaluate("""
-                                        (url) => {
-                                            var audio = new Audio();
-                                            audio.src = url;
-                                            audio.load();
-                                        }
-                                    """, signed_url)
-                                    time.sleep(8)
-                            except Exception as e:
-                                print(f"  Signed URL fetch failed: {e}")
+                            download_part_from_signed_url(page, missing_part, signed_url)
     
                         if missing_part in downloaded_parts:
                             print(f"  Successfully retrieved Part {missing_part}!")
                         else:
                             print(f"  Failed to retrieve Part {missing_part}.")
     
-                    # Method 2: Systematic forward scan from beginning for remaining missing parts
+                    # Method 2: 15s rewind/advance from the current playhead. Missing parts
+                    # at the end of the book sit just behind The End; chapter-scanning from
+                    # the start fails because Previous/Next Chapter are relabelled there.
                     still_missing = [p for p in missing_parts if p not in downloaded_parts]
                     if still_missing:
-                        print(f"\nSystematic scan for {len(still_missing)} remaining missing parts: {still_missing}")
+                        print(f"\n15s walk for {len(still_missing)} remaining missing parts: {still_missing}")
                         player_fl = page.frame_locator('iframe[src*="listen.libbyapp.com"]')
-    
-                        print("  Rewinding to beginning...")
-                        for _ in range(50):
-                            try:
-                                player_fl.locator('button[aria-label*="Previous Chapter"]').first.click(timeout=2000)
-                                time.sleep(0.5)
-                            except (PlaywrightTimeoutError, Exception):
-                                break
-                        time.sleep(3)
-    
-                        print("  Scanning forward through all chapters...")
-                        for scan_i in range(100):
-                            remaining = [p for p in still_missing if p not in downloaded_parts]
-                            if not remaining:
-                                print(f"  All missing parts found after {scan_i} chapter scans!")
-                                break
-                            try:
-                                player_fl.locator('button[aria-label*="Next Chapter"]').first.click(timeout=3000)
-                                time.sleep(3)
-                                newly_found = [p for p in still_missing if p in downloaded_parts and p not in found_parts]
-                            except (PlaywrightTimeoutError, Exception):
-                                print(f"  End of book reached after {scan_i} chapter scans.")
-                                break
-    
+                        landed = max(max_part_number_seen, max(still_missing)) + 1
+                        fill_gap_with_15s_skips(
+                            page, player_fl, landed,
+                            lo_px=None, skip_budget=MAX_GAP_SKIP_CLICKS, wait_sec=GAP_SKIP_WAIT_SEC,
+                        )
                         final_missing = [p for p in missing_parts if p not in downloaded_parts]
                         if final_missing:
-                            print(f"  Parts still missing after full scan: {final_missing}")
+                            print(f"  Parts still missing after 15s walk: {final_missing}")
                         else:
                             print(f"  All parts successfully retrieved!")
     
