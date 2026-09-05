@@ -9,6 +9,8 @@ This Python script automates the process of logging into Libby (libbyapp.com), n
 * Lists audiobooks on your shelf for interactive selection.
 * Downloads individual MP3 parts of the selected audiobook.
 * Attempts to retrieve any missing parts by navigating backward in the player.
+* Organizes downloads in Libation-style folders: `{Author fileAs}/{Series}/{#}_{Title}/Part_NN.mp3` when series metadata is available, otherwise `{Author fileAs}/{Title}/`. Colons and other unsafe characters are stripped from folder names for Android MTP compatibility.
+* Downloads the cover image from OverDrive metadata into each book folder as `cover.jpg` (or `.png`/`.webp`).
 * Configuration details (library card, PIN, library name, download directory) are stored securely in a `libby_config.json` file after the first run.
 
 ## Prerequisites
